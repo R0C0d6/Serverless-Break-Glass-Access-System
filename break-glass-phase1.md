@@ -125,7 +125,7 @@ This is the role that gets temporarily assumed when an engineer needs elevated a
 2. On the left sidebar, click **Roles**.
 3. Click the orange **Create role** button.
 4. Under **Trusted entity type**, select **Custom trust policy**.
-5. A JSON editor box will appear. Clear everything in it, then copy and paste the trust policy below:
+5. A JSON editor box will appear. Clear everything in it, then copy and paste the trust policy below. **Replace `YOUR_ACCOUNT_ID` with your real 12-digit account ID:**
 
 ```json
 {
@@ -134,15 +134,18 @@ This is the role that gets temporarily assumed when an engineer needs elevated a
     {
       "Effect": "Allow",
       "Principal": {
-        "Service": "lambda.amazonaws.com"
+        "AWS": "arn:aws:iam::YOUR_ACCOUNT_ID:role/BreakGlass-LambdaExecutionRole"
       },
-      "Action": "sts:AssumeRole"
+      "Action": [
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ]
     }
   ]
 }
 ```
 
-   **What this means in plain English:** "Only AWS Lambda functions can assume this role — not individual users, not other services, not people logging into the console. We'll tighten this further in Phase 3 to only allow *our specific* Lambda execution role, not just any Lambda in the account."
+   **What this means in plain English:** "Only the `BreakGlass-LambdaExecutionRole` IAM role can assume this role. `sts:TagSession` is also included because when our Approval Handler calls `sts:AssumeRole` with session tags (to stamp the grant ID, requester, and approver onto the session for auditing), AWS checks *both* the caller's identity policy *and* the trust policy of the target role. Both must allow `sts:TagSession` for tagged sessions to be issued."
 
 6. Click the orange **Next** button.
 7. On the **Add permissions** page, do **not** attach any policies here — skip it entirely. We'll add the permission boundary and an inline policy in the next two steps. Click **Next**.
@@ -261,7 +264,10 @@ Now we give the Lambda execution role its scoped permissions. You'll need two pi
     {
       "Sid": "AllowAssumeBreakGlassRole",
       "Effect": "Allow",
-      "Action": "sts:AssumeRole",
+      "Action": [
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ],
       "Resource": "arn:aws:iam::YOUR_ACCOUNT_ID:role/BreakGlass-ElevatedAccessRole"
     },
     {
