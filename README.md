@@ -24,10 +24,14 @@ A serverless solution for emergency access management.
 - [The Problem](#the-problem)
 - [What This System Does](#what-this-system-does)
 - [Architecture](#architecture)
-- [Access Lifecycle](#access-lifecycle)
-- [Security Model](#security-model)
-- [Components](#components)
+- [How Access Flows](#how-access-flows)
+- [The Security Model](#the-security-model)
 - [Build Walkthrough](#build-walkthrough)
+  - [Phase 1 — Foundation](#phase-1--foundation-dynamodb--permission-boundary)
+  - [Phase 2 — Identity](#phase-2--identity-the-two-iam-roles)
+  - [Phase 3 — Logic](#phase-3--logic-the-lambda-functions)
+  - [Phase 4 — Orchestration](#phase-4--orchestration-sns-api-gateway-step-functions)
+  - [Phase 5 — Audit and Failsafe](#phase-5--audit-and-failsafe)
 - [End-to-End Test](#end-to-end-test)
 - [Lessons Learned](#lessons-learned)
 - [Known Limitations](#known-limitations)
@@ -62,115 +66,486 @@ Key properties:
 
 ## Architecture
 
-<!-- TODO: Insert architecture diagram here once drawn.
-     Suggested tool: draw.io / Excalidraw, exported to screenshots/architecture/diagram.png -->
-
-<!-- ![Architecture diagram](screenshots/architecture/diagram.png) -->
-
-<!-- TODO: 1–2 paragraphs walking through the diagram. -->
-
-**Region:** <!-- TODO: e.g. us-east-1 -->
+**Region:** `us-east-1`
 **Scenario implemented:** Scenario A — SSM Session Manager access to a tagged EC2 instance.
 
----
-
-## Access Lifecycle
-
-<!-- TODO: Consider a mermaid sequence diagram here — GitHub renders it natively.
-     Skeleton below; fill in / correct the participants and messages. -->
+> **Note:** the diagram below is written in Mermaid. It renders as a picture on GitHub.
+> In VS Code's built-in preview it will look like plain code unless you install the
+> *Markdown Preview Mermaid Support* extension.
 
 ```mermaid
-sequenceDiagram
-    participant E as Engineer
-    participant RH as Request Handler
-    participant DB as DynamoDB
-    participant SNS
-    participant A as Approver
-    participant AH as Approval Handler
-    participant STS
-    participant SFN as Step Functions
-    participant AR as Auto-Revoke
+flowchart TD
+    ENG([Engineer])
+    APR([Approver])
 
-    E->>RH: TODO
-    RH->>DB: TODO
-    RH->>SNS: TODO
-    RH->>SFN: TODO
-    SNS->>A: TODO
-    A->>AH: TODO
-    AH->>STS: TODO
-    AH->>DB: TODO
-    SFN->>AR: TODO
-    AR->>DB: TODO
+    ENG -->|1 · submit request| RH[Lambda: RequestHandler]
+
+    RH -->|2 · write status=pending| DDB[(DynamoDB<br/>breakglass-grants)]
+    RH -->|3 · publish| SNS{{SNS<br/>breakglass-approvals}}
+    RH -->|4 · start timer| SFN[Step Functions<br/>BreakGlass-StateMachine]
+
+    SNS -->|5 · approval email| APR
+    APR -->|6 · click approve link| APIGW[API Gateway<br/>GET /approve]
+    APIGW --> AH[Lambda: ApprovalHandler<br/>enforces requester ≠ approver]
+
+    AH -->|7 · AssumeRole + session tags| STS[STS]
+    STS --> ROLE[IAM Role<br/>BreakGlass-ElevatedAccessRole]
+    PB[Permission Boundary<br/>SSM only · tagged instances only] -.->|hard ceiling| ROLE
+    ROLE -->|8 · ssm:StartSession| EC2[EC2 Instance<br/>tag BreakGlassEligible true]
+    AH -->|status=active| DDB
+    AH -->|credentials| SNS
+
+    SFN -->|9 · after grant duration| AR[Lambda: AutoRevoke]
+    AR -->|status=expired| DDB
+    AR --> SNS
+
+    SCHED[EventBridge<br/>rate 5 minutes] --> FS[Lambda: FailsafeScanner]
+    FS -.->|zombie grants| AR
+
+    ROLE -.->|AssumeRole event| CT[CloudTrail]
+    CT --> EB[EventBridge<br/>AssumeRoleAlert]
+    EB --> SNS
 ```
 
-| Stage | Trigger | What happens | Record state |
-|---|---|---|---|
-| Request | <!-- TODO --> | <!-- TODO --> | `pending` |
-| Approval | <!-- TODO --> | <!-- TODO --> | `active` |
-| Expiry | <!-- TODO --> | <!-- TODO --> | `expired` |
-| Failsafe | <!-- TODO --> | <!-- TODO --> | `expired` |
+<!-- TODO: 1–2 paragraphs walking through the diagram in prose. -->
 
 ---
 
-## Security Model
+## How Access Flows
 
-The design rests on four independent controls. Each one has to fail before privilege escalation is possible.
+<!-- TODO: Walk through the lifecycle as a short narrative — six or seven sentences.
+     The diagram above shows the wiring; this should explain the story. -->
 
-### 1. Permission boundary as a hard ceiling
+**1 · Request.** <!-- TODO: what the engineer does, what gets written, record status becomes `pending` -->
+
+**2 · Notify.** <!-- TODO: SNS email to the approver, what the email contains -->
+
+**3 · Approve.** <!-- TODO: approver clicks, checks that run, credentials minted, status becomes `active` -->
+
+**4 · Use.** <!-- TODO: engineer opens the SSM session, what they can and cannot do -->
+
+**5 · Expire.** <!-- TODO: timer fires, status becomes `expired`, credentials die -->
+
+**6 · Failsafe.** <!-- TODO: the 5-minute sweep and what it catches -->
+
+---
+
+## The Security Model
+
+Four independent controls. Every one of them has to fail before privilege escalation is possible.
+
+### 1 · The permission boundary is a hard ceiling
 
 <!-- TODO: Explain what a permission boundary is and why it's the centrepiece.
-     Emphasise: it caps the role permanently, regardless of what policies get attached later. -->
+     Key point to make: it caps the role permanently, no matter what policies
+     get attached to it later. -->
 
-<!-- ![Permission boundary JSON](screenshots/phase_one/permission_boundary_json.png) -->
-<!-- ![Permission boundary created](screenshots/phase_one/break_glass_permission_boundary_details.png) -->
+The policy we attached:
 
-### 2. Tag-scoped resource access
+![Permission boundary JSON](screenshots/phase_one/permission_boundary_json.png)
 
-<!-- TODO: Explain the BreakGlassEligible=true condition — access is opt-in per instance. -->
+<!-- TODO: 1–2 sentences on what this JSON allows, in plain English. -->
 
-<!-- ![Instance tagged BreakGlassEligible](screenshots/phase_one/break_glass_eligible_tagging.png) -->
+![Permission boundary created](screenshots/phase_one/break_glass_permission_boundary_details.png)
 
-### 3. Constrained trust policy
+### 2 · Access is opt-in per instance
 
-<!-- TODO: Explain that only BreakGlass-LambdaExecutionRole can assume the elevated role —
-     no human principal can, even with correct credentials. Mention why sts:TagSession is needed. -->
+<!-- TODO: Explain the BreakGlassEligible=true condition — an instance is invisible
+     to the break-glass role until somebody deliberately tags it. -->
 
-<!-- ![Break-glass role trust policy](screenshots/phase_two/break_glass_iamRole_json.png) -->
-<!-- ![Permission boundary attached to role](screenshots/phase_two/permission_boundary_attach.png) -->
+![Instance tagged BreakGlassEligible](screenshots/phase_one/break_glass_eligible_tagging.png)
 
-### 4. Separation of duties
+### 3 · Only Lambda can assume the elevated role
 
-<!-- TODO: The requester ≠ approver check. Be honest about how it's currently enforced
-     (code-level string comparison) and note the limitation — see Known Limitations. -->
+<!-- TODO: Explain that the trust policy names exactly one principal —
+     BreakGlass-LambdaExecutionRole. No human can assume this role directly, even
+     with valid credentials. Mention why sts:TagSession is in there. -->
+
+![Break-glass role trust policy](screenshots/phase_two/break_glass_iamRole_json.png)
+
+### 4 · Separation of duties
+
+<!-- TODO: The requester ≠ approver check. Be honest about how it's enforced today
+     (a string comparison in the Approval Handler) and point at Known Limitations #1. -->
 
 ### Least privilege on the Lambda execution role
 
-<!-- TODO: Note that this role is the highest-value identity in the system and why. -->
+<!-- TODO: Note that this role is the highest-value identity in the system —
+     it can mint elevated access — and what you scoped it down to. -->
 
-<!-- ![Lambda execution role inline policy](screenshots/phase_two/lambda_execution_role_inline_policy.png) -->
-<!-- ![Lambda execution role details](screenshots/phase_two/breakglass_lambdaexecutionRole_details.png) -->
+![Lambda execution role inline policy](screenshots/phase_two/lambda_execution_role_inline_policy.png)
 
 ---
 
-## Components
+## Build Walkthrough
 
-| Component | Name | Role in the system |
-|---|---|---|
-| DynamoDB table | `breakglass-grants` | <!-- TODO --> |
-| Permission boundary | `BreakGlass-PermissionBoundary` | <!-- TODO --> |
-| Elevated access role | `BreakGlass-ElevatedAccessRole` | <!-- TODO --> |
-| Lambda execution role | `BreakGlass-LambdaExecutionRole` | <!-- TODO --> |
-| Lambda | `BreakGlass-RequestHandler` | <!-- TODO --> |
-| Lambda | `BreakGlass-ApprovalHandler` | <!-- TODO --> |
-| Lambda | `BreakGlass-AutoRevoke` | <!-- TODO --> |
-| Lambda | `BreakGlass-FailsafeScanner` | <!-- TODO --> |
-| SNS topic | `breakglass-approvals` | <!-- TODO --> |
-| REST API | `BreakGlass-ApprovalAPI` | <!-- TODO --> |
-| State machine | `BreakGlass-StateMachine` | <!-- TODO --> |
-| EventBridge rule | `BreakGlass-AssumeRoleAlert` | <!-- TODO --> |
-| EventBridge rule | `BreakGlass-FailsafeSchedule` | <!-- TODO --> |
-| CloudTrail | <!-- TODO: trail name --> | <!-- TODO --> |
-| Security Hub | — | <!-- TODO --> |
+Everything below was built through the AWS Console. The full click-by-click guide is in
+[`break-glass-phase1.md`](break-glass-phase1.md).
+
+<!-- TODO: rename that file — it currently holds all five phases despite the name. -->
+
+---
+
+### Phase 1 — Foundation: DynamoDB + permission boundary
+
+<!-- TODO: 2–3 sentences — what this phase establishes and why it has to come first. -->
+
+#### Step 1 · Create the grants table
+
+We created a DynamoDB table named `breakglass-grants` with `grant_id` (String) as the partition
+key, and left every other setting at its default.
+
+<!-- TODO: add a sentence on why no sort key and why on-demand capacity. -->
+
+![DynamoDB table configuration](screenshots/phase_one/create_dynamodb_table_details.png)
+
+**What we observed:** <!-- TODO: e.g. table went Active after ~40s; Explore items showed empty -->
+
+#### Step 2 · Write the permission boundary
+
+<!-- TODO: what you pasted and why this is the most important step in the build. -->
+
+![Permission boundary JSON](screenshots/phase_one/permission_boundary_json.png)
+
+**What we observed:**
+
+![Policy created successfully](screenshots/phase_one/permission_boundary_success.png)
+
+#### Step 3 · Prepare the target EC2 instance
+
+The instance needs an instance profile with SSM permissions before Session Manager can reach it.
+
+![EC2 SSM role permissions](screenshots/phase_one/ec2_ssm_role_permissions.png)
+
+![Instance profile attached](screenshots/phase_one/ec2_attacched_ssmrole_details.png)
+
+**What we observed:** <!-- TODO: how long until the instance appeared as Managed in Fleet Manager -->
+
+![Instance visible in Fleet Manager](screenshots/phase_one/ec2_fleet_manager_check.png)
+
+#### Step 4 · Tag the instance as eligible
+
+<!-- TODO: one sentence — this tag is what the boundary condition keys on. -->
+
+![BreakGlassEligible tag applied](screenshots/phase_one/break_glass_eligible_tagging.png)
+
+---
+
+### Phase 2 — Identity: the two IAM roles
+
+<!-- TODO: 2–3 sentences. Worth calling out the chicken-and-egg problem — the trust policy
+     references a role that doesn't exist yet — and how you worked around it. -->
+
+#### Step 1 · Create the break-glass role with a custom trust policy
+
+<!-- TODO: what you pasted, and what the trust policy means in plain English. -->
+
+![Trust policy](screenshots/phase_two/break_glass_iamRole_json.png)
+
+![Role created](screenshots/phase_one/break_glassElevatedAccess_details.png)
+
+<!-- NOTE: this screenshot lives in screenshots/phase_one/ but is a Phase 2 artifact.
+     Consider moving it to screenshots/phase_two/ and updating this path. -->
+
+**What we observed:** <!-- TODO: e.g. role created with no policies and no boundary yet -->
+
+#### Step 2 · Attach the permission boundary
+
+<!-- TODO: one or two sentences on what changes the moment the boundary is set. -->
+
+![Boundary attached to role](screenshots/phase_two/permission_boundary_attach.png)
+
+#### Step 3 · Attach the inline access policy
+
+<!-- TODO: explain the double-lock — boundary and policy must BOTH allow an action.
+     Explain why they're deliberately identical here. -->
+
+![Inline policy on elevated access role](screenshots/phase_two/inline_policy_for_elevatedaccessrole.png)
+
+#### Step 4 · Create and scope the Lambda execution role
+
+<!-- TODO: 1–2 sentences on what this role is allowed to do and why nothing more. -->
+
+![Lambda execution role](screenshots/phase_two/breakglass_lambdaexecutionRole_details.png)
+
+![Execution role inline policy](screenshots/phase_two/lambda_execution_role_inline_policy.png)
+
+**What we observed:** <!-- TODO -->
+
+---
+
+### Phase 3 — Logic: the Lambda functions
+
+<!-- TODO: 2–3 sentences. Three functions, one shared execution role, what each owns. -->
+
+#### Step 1 · Request Handler
+
+Accepts the access request, writes a `pending` record, publishes to SNS, and starts the
+state machine.
+
+![Request Handler function](screenshots/phase_three/lambda_request_handler_details00.png)
+
+![Request Handler code](screenshots/phase_three/request_handler_code.png)
+
+We confirmed the function runs under `BreakGlass-LambdaExecutionRole`, not an auto-generated one:
+
+![Execution role confirmed](screenshots/phase_three/request_handler_execution_role.png)
+
+**What we observed:** <!-- TODO: the first test failed at the SNS step because the ARN was still
+     a placeholder, but the DynamoDB write succeeded — describe what you saw in the table -->
+
+![Grant record written](screenshots/phase_one/dynamo_table_items.png)
+
+#### Step 2 · Approval Handler
+
+<!-- TODO: what it validates before minting credentials — grant exists, still pending,
+     requester ≠ approver. -->
+
+![Approval Handler function](screenshots/phase_three/lambda_approval_handler_details.png)
+
+**What we observed:** <!-- TODO -->
+
+#### Step 3 · Auto-Revoke
+
+<!-- TODO: what it does and — importantly — what it does NOT do (see Known Limitations #5). -->
+
+![Auto-Revoke function](screenshots/phase_three/lambda_auto_revoke_details.png)
+
+**What we observed:** <!-- TODO -->
+
+---
+
+### Phase 4 — Orchestration: SNS, API Gateway, Step Functions
+
+<!-- TODO: 2–3 sentences on what this phase ties together. -->
+
+#### Step 1 · Create the SNS topic and confirm the subscription
+
+<!-- TODO: what you created; note that an unconfirmed subscription fails silently. -->
+
+<!-- TODO: ![SNS topic](screenshots/phase_four/...) -->
+
+**What we observed:** <!-- TODO -->
+
+#### Step 2 · Replace the SNS placeholders in all three functions
+
+<!-- TODO: how many places needed editing — this is the pain point that argues for
+     environment variables. See Known Limitations #8. -->
+
+<!-- TODO: ![...](screenshots/phase_four/...) -->
+
+#### Step 3 · Build the approval endpoint in API Gateway
+
+<!-- TODO: REST API, /approve resource, GET method, Lambda proxy integration, prod stage. -->
+
+<!-- TODO: ![...](screenshots/phase_four/...) -->
+
+**What we observed:** <!-- TODO: hitting the URL with a fake grant_id returned "Grant not found",
+     which proved the wiring worked -->
+
+#### Step 4 · Put the real approval link in the email
+
+<!-- TODO -->
+
+<!-- TODO: ![Approval email received](screenshots/phase_four/...) -->
+
+#### Step 5 · Build the Step Functions state machine
+
+<!-- TODO: what the machine does — wait, then invoke Auto-Revoke. -->
+
+<!-- TODO: ![State machine definition](screenshots/phase_four/...) -->
+
+**What we observed:** <!-- TODO: the test execution with wait_seconds=10 -->
+
+<!-- TODO: ![Execution graph](screenshots/phase_four/...) -->
+
+#### Step 6 · Wire the Request Handler to start the state machine
+
+<!-- TODO: the extra IAM permission needed, and the code change. -->
+
+**What we observed:** <!-- TODO: all three things firing at once — DynamoDB record, email,
+     and a waiting execution -->
+
+---
+
+### Phase 5 — Audit and Failsafe
+
+<!-- TODO: 2–3 sentences. -->
+
+#### Step 1 · Confirm CloudTrail is recording
+
+<!-- TODO -->
+
+<!-- TODO: ![CloudTrail](screenshots/phase_five/...) -->
+
+#### Step 2 · Enable Security Hub
+
+<!-- TODO -->
+
+<!-- TODO: ![Security Hub](screenshots/phase_five/...) -->
+
+#### Step 3 · Build the AssumeRole tripwire
+
+<!-- TODO: the EventBridge pattern and why a real-time alert on role assumption matters. -->
+
+<!-- TODO: ![EventBridge rule](screenshots/phase_five/...) -->
+
+**What we observed:** <!-- TODO: the alert email and how long after the assume it arrived -->
+
+#### Step 4 · Build the scheduled failsafe
+
+<!-- TODO: the fourth Lambda plus the 5-minute schedule, and what failure it protects against. -->
+
+<!-- TODO: ![Failsafe schedule](screenshots/phase_five/...) -->
+
+**What we observed:** <!-- TODO: `{"scanned": true, "revoked_count": 0}` on a clean run -->
+
+---
+
+## End-to-End Test
+
+**Tested:** <!-- TODO: date --> · **Result:** <!-- TODO: passed / passed after fixes -->
+
+<!-- TODO: This is the most credible section in the whole document — a real trace beats
+     any amount of description. Narrate the actual run, in order, with the evidence
+     inline at each step. -->
+
+**Scenario:** <!-- TODO: e.g. "An engineer needs shell access to a production instance
+that has stopped responding to health checks." -->
+
+**1 · The request goes in.**
+<!-- TODO: what you sent, what came back -->
+
+**2 · The grant lands as pending.**
+<!-- TODO: what the DynamoDB record looked like -->
+
+**3 · The approval email arrives.**
+<!-- TODO: how long it took, what the email contained -->
+
+**4 · The timer starts.**
+<!-- TODO: state machine sitting in WaitForGrantDuration -->
+
+**5 · The approver clicks approve.**
+<!-- TODO: what the browser showed -->
+
+**6 · Credentials are issued.**
+<!-- TODO: the second email, record flipping to active -->
+
+**7 · The session opens.**
+<!-- TODO: this is the money shot — the actual SSM session on the instance -->
+
+**8 · The tripwire fires.**
+<!-- TODO: the EventBridge alert email -->
+
+**9 · The grant expires.**
+<!-- TODO: record flipping to expired -->
+
+**10 · The credentials stop working.**
+<!-- TODO: what error you got when you tried to reuse them -->
+
+### Negative tests
+
+<!-- TODO: These are what prove the controls actually bite. Each one is worth a
+     screenshot of the denial — a denied action is stronger evidence than a
+     successful one. -->
+
+**Requester tries to approve their own request.**
+Expected `403`. <!-- TODO: observed + screenshot -->
+
+**Approving a grant that is already active.**
+Expected `409`. <!-- TODO: observed + screenshot -->
+
+**Opening a session on an untagged instance.**
+Expected `AccessDenied`. <!-- TODO: observed + screenshot -->
+
+**Calling a non-SSM API with the break-glass credentials.**
+Expected `AccessDenied` — this is the boundary doing its job. <!-- TODO: observed + screenshot -->
+
+**Reusing the credentials after expiry.**
+Expected `ExpiredToken`. <!-- TODO: observed + screenshot -->
+
+---
+
+## Lessons Learned
+
+### SSM Session Manager needs the session document in the boundary
+
+**Symptom.** <!-- TODO: what the error actually said, verbatim if you have it. This is the
+     problem that cost you the most time during testing — describe it properly. -->
+
+**Diagnosis.** `ssm:StartSession` authorises against *two* resources, not one — the target EC2
+instance **and** the Session Manager document (`SSM-SessionManagerRunShell`). The permission
+boundary as originally written only allowed the instance, so the call was denied at the document.
+The `ssm:resourceTag/BreakGlassEligible` condition also cannot apply to a document ARN, which is
+why the document needs its own statement rather than being folded into the existing one.
+
+**Fix.**
+
+```json
+<!-- TODO: paste the corrected boundary statement -->
+```
+
+<!-- TODO: ![Corrected boundary](screenshots/...) -->
+
+**Takeaway.** <!-- TODO: 1–2 sentences. Something like: a permission boundary is only as good as
+     your understanding of which resources an API call actually touches — and the docs don't
+     always make that obvious. -->
+
+### <!-- TODO: second lesson, if you have one -->
+
+<!-- TODO -->
+
+---
+
+## Known Limitations
+
+Naming these is deliberate. Each one is a real gap, and together they are the backlog.
+
+**1 · The approval endpoint is unauthenticated.**
+`approver` arrives as a query-string parameter supplied by whoever calls the URL, so anyone
+holding the link can approve, and the requester ≠ approver check can be sidestepped by simply
+typing a different email into the URL.
+*Planned fix:* an HMAC-signed, single-use token, or an API Gateway authorizer.
+
+**2 · Approval happens on a `GET`.**
+Corporate mail scanners and link-preview services fetch URLs in emails automatically, which can
+approve a request before a human ever reads it.
+*Planned fix:* confirmation page on `GET`, state change on `POST`.
+
+**3 · Credentials are emailed in plaintext.**
+They persist in mailboxes, backups and SNS delivery logs — and they reach the approver rather
+than the requester.
+*Planned fix:* notify only; the requester retrieves credentials once from an authenticated endpoint.
+
+**4 · Approval reads then writes without a condition.**
+Two clicks in quick succession can both pass the "is it still pending?" check and issue two
+separate sessions.
+*Planned fix:* a `ConditionExpression` on the status update.
+
+**5 · Auto-revoke does not actually revoke.**
+It updates the DynamoDB record; the credentials themselves remain valid until natural expiry,
+so a session cannot be cut short.
+*Planned fix:* an `aws:TokenIssueTime` deny policy plus `ssm:TerminateSession`.
+
+**6 · Pending requests never expire.**
+A request raised last week is still approvable today.
+*Planned fix:* an age check against `requested_at`.
+
+**7 · The failsafe uses `Scan`.**
+Cost and latency grow with the size of the table.
+*Planned fix:* a GSI on `status`, queried instead of scanned.
+
+**8 · ARNs are hardcoded in function source.**
+Every environment means hand-editing several files, and it is easy to miss one.
+*Planned fix:* Lambda environment variables.
+
+**9 · The whole thing was built by console click-through.**
+Not reproducible, and no review trail on infrastructure changes.
+*Planned fix:* Terraform — see [`terraform/`](terraform/).
+
+---
+
+## Reference
 
 ### The grants table
 
@@ -182,174 +557,38 @@ The design rests on four independent controls. Each one has to fail before privi
 | `reason` | String | <!-- TODO --> |
 | `duration_minutes` | Number | <!-- TODO --> |
 | `status` | String | `pending` → `active` → `expired` |
-| `requested_at` | String | <!-- TODO --> |
+| `requested_at` | String | ISO 8601, UTC |
 | `approver` | String | <!-- TODO --> |
 | `approved_at` | String | <!-- TODO --> |
 | `expires_at` | String | <!-- TODO --> |
 | `revoked_at` | String | <!-- TODO --> |
 
-<!-- ![DynamoDB table configuration](screenshots/phase_one/create_dynamodb_table_details.png) -->
-<!-- ![Grant records](screenshots/phase_one/dynamo_table_items.png) -->
+### Resources created
 
----
-
-## Build Walkthrough
-
-The full click-by-click build guide lives in [`break-glass-phase1.md`](break-glass-phase1.md).
-<!-- TODO: rename that file once split — it currently contains all five phases. -->
-
-### Phase 1 — Foundation: DynamoDB + permission boundary
-
-<!-- TODO: 2–3 sentences summarising what this phase established and why it comes first. -->
-
-| Evidence | Screenshot |
+| Type | Name |
 |---|---|
-| DynamoDB table created | <!-- ![](screenshots/phase_one/create_dynamodb_table_details.png) --> |
-| Boundary policy JSON | <!-- ![](screenshots/phase_one/permission_boundary_json.png) --> |
-| Boundary policy created | <!-- ![](screenshots/phase_one/permission_boundary_success.png) --> |
-| Instance tagged | <!-- ![](screenshots/phase_one/break_glass_eligible_tagging.png) --> |
-| SSM agent reachable | <!-- ![](screenshots/phase_one/ec2_fleet_manager_check.png) --> |
-| EC2 instance profile | <!-- ![](screenshots/phase_one/ec2_attacched_ssmrole_details.png) --> |
-
-### Phase 2 — Identity: the two IAM roles
-
-<!-- TODO: 2–3 sentences. Emphasise the chicken-and-egg ordering (trust policy references a role
-     that doesn't exist yet) if that tripped you up. -->
-
-| Evidence | Screenshot |
-|---|---|
-| Break-glass role trust policy | <!-- ![](screenshots/phase_two/break_glass_iamRole_json.png) --> |
-| Boundary attached | <!-- ![](screenshots/phase_two/permission_boundary_attach.png) --> |
-| Inline access policy | <!-- ![](screenshots/phase_two/inline_policy_for_elevatedaccessrole.png) --> |
-| Lambda execution role | <!-- ![](screenshots/phase_two/breakglass_lambdaexecutionRole_details.png) --> |
-| Execution role policy | <!-- ![](screenshots/phase_two/lambda_execution_role_inline_policy.png) --> |
-
-### Phase 3 — Logic: the Lambda functions
-
-<!-- TODO: 2–3 sentences. -->
-
-| Evidence | Screenshot |
-|---|---|
-| Request Handler | <!-- ![](screenshots/phase_three/lambda_request_handler_details00.png) --> |
-| Request Handler code | <!-- ![](screenshots/phase_three/request_handler_code.png) --> |
-| Execution role bound | <!-- ![](screenshots/phase_three/request_handler_execution_role.png) --> |
-| Approval Handler | <!-- ![](screenshots/phase_three/lambda_approval_handler_details.png) --> |
-| Auto-Revoke | <!-- ![](screenshots/phase_three/lambda_auto_revoke_details.png) --> |
-
-### Phase 4 — Orchestration: SNS, API Gateway, Step Functions
-
-<!-- TODO: 2–3 sentences. -->
-
-| Evidence | Screenshot |
-|---|---|
-| SNS topic | <!-- TODO: screenshots/phase_four/... --> |
-| Subscription confirmed | <!-- TODO --> |
-| API Gateway resource + method | <!-- TODO --> |
-| API deployed to stage | <!-- TODO --> |
-| State machine definition | <!-- TODO --> |
-| Execution graph | <!-- TODO --> |
-
-### Phase 5 — Audit and failsafe
-
-<!-- TODO: 2–3 sentences. -->
-
-| Evidence | Screenshot |
-|---|---|
-| CloudTrail logging | <!-- TODO: screenshots/phase_five/... --> |
-| Security Hub enabled | <!-- TODO --> |
-| AssumeRole alert rule | <!-- TODO --> |
-| Failsafe schedule | <!-- TODO --> |
-| Failsafe scanner run | <!-- TODO --> |
-
----
-
-## End-to-End Test
-
-**Tested:** <!-- TODO: date --> · **Result:** <!-- TODO: pass / pass with fixes -->
-
-<!-- TODO: Narrate the actual run you did. This is the most credible section in the whole
-     document — a real trace beats any amount of description. Suggested shape below. -->
-
-**Scenario:** <!-- TODO: e.g. "Engineer needs shell access to an unresponsive production instance." -->
-
-| # | Step | Expected | Observed | Evidence |
-|---|---|---|---|---|
-| 1 | Submit request | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 2 | Grant written as `pending` | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 3 | Approval email delivered | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 4 | State machine waiting | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 5 | Approver clicks link | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 6 | STS credentials issued | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 7 | SSM session opened | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 8 | EventBridge tripwire fired | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 9 | Timer expires, grant revoked | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-| 10 | Session no longer usable | <!-- TODO --> | <!-- TODO --> | <!-- TODO --> |
-
-### Negative tests
-
-<!-- TODO: These prove the controls actually bite. Worth doing if you haven't yet. -->
-
-| Test | Expected result | Observed |
-|---|---|---|
-| Requester approves own request | `403` | <!-- TODO --> |
-| Approve an already-approved grant | `409` | <!-- TODO --> |
-| Session against an untagged instance | `AccessDenied` | <!-- TODO --> |
-| Any non-SSM API call with the credentials | `AccessDenied` | <!-- TODO --> |
-| Credentials used after expiry | `ExpiredToken` | <!-- TODO --> |
-
----
-
-## Lessons Learned
-
-<!-- TODO: The most valuable section for a reader. Real problems, real diagnosis, real fixes.
-     Use the shape below for each one. -->
-
-### SSM Session Manager needs the session document in the boundary
-
-**Symptom:** <!-- TODO: what the error looked like, verbatim if you have it -->
-
-**Diagnosis:** `ssm:StartSession` authorises against *two* resources, not one — the target EC2 instance **and** the Session Manager document (e.g. `SSM-SessionManagerRunShell`). The permission boundary as originally written only allowed the instance, so the call was denied at the document. The `ssm:resourceTag/BreakGlassEligible` condition also cannot apply to a document ARN, so the document needs its own statement rather than being folded into the existing one.
-
-**Fix:** <!-- TODO: paste the corrected boundary statement here -->
-
-```json
-<!-- TODO: the revised policy JSON -->
-```
-
-**Takeaway:** <!-- TODO: 1–2 sentences on the general principle — a permission boundary is only
-     as good as your understanding of which resources an API call actually touches. -->
-
-### <!-- TODO: second lesson, if any -->
-
-<!-- TODO -->
-
----
-
-## Known Limitations
-
-<!-- TODO: Keep this section. Naming your own gaps reads as competence, not weakness —
-     and it doubles as the backlog. Starters below; edit, expand, or remove. -->
-
-| # | Limitation | Impact | Planned fix |
-|---|---|---|---|
-| 1 | Approval endpoint is unauthenticated and `approver` is supplied by the caller | Anyone with the URL can approve; the requester ≠ approver check can be bypassed by changing the query string | HMAC-signed single-use token, or an API Gateway authorizer |
-| 2 | Approval is a `GET` | Email link scanners may prefetch the URL and approve a request automatically | Confirmation page on `GET`, state change on `POST` |
-| 3 | STS credentials are emailed in plaintext to the SNS topic | Credentials persist in mailboxes and delivery logs, and reach the approver rather than the requester | Notify only; requester retrieves credentials once from an authenticated endpoint |
-| 4 | Approval is read-then-write without a condition expression | Two concurrent approvals can both issue credentials | `ConditionExpression` on the status update |
-| 5 | Auto-revoke updates the record but cannot cut a live session short | Credentials remain valid until natural expiry | `aws:TokenIssueTime` deny policy plus `ssm:TerminateSession` |
-| 6 | Pending requests never expire | A stale request can be approved days later | Age check against `requested_at` |
-| 7 | Failsafe uses `Scan` | Cost and latency grow with table size | GSI on `status`, queried instead |
-| 8 | ARNs are hardcoded in function source | Four manual edits per environment; easy to miss one | Lambda environment variables |
-| 9 | Built by console click-through | Not reproducible; no review trail on infrastructure changes | Terraform — see `terraform/` |
+| DynamoDB table | `breakglass-grants` |
+| IAM policy (boundary) | `BreakGlass-PermissionBoundary` |
+| IAM role | `BreakGlass-ElevatedAccessRole` |
+| IAM role | `BreakGlass-LambdaExecutionRole` |
+| Lambda | `BreakGlass-RequestHandler` |
+| Lambda | `BreakGlass-ApprovalHandler` |
+| Lambda | `BreakGlass-AutoRevoke` |
+| Lambda | `BreakGlass-FailsafeScanner` |
+| SNS topic | `breakglass-approvals` |
+| REST API | `BreakGlass-ApprovalAPI` |
+| State machine | `BreakGlass-StateMachine` |
+| EventBridge rule | `BreakGlass-AssumeRoleAlert` |
+| EventBridge rule | `BreakGlass-FailsafeSchedule` |
 
 ---
 
 ## Roadmap
 
-- [ ] Codify the whole stack in Terraform (`terraform/main.tf` is currently a placeholder)
-- [ ] <!-- TODO: signed approval tokens -->
+- [ ] Codify the whole stack in Terraform (`terraform/main.tf` is currently empty)
+- [ ] <!-- TODO: signed, single-use approval tokens -->
 - [ ] <!-- TODO: Slack interactive approve/deny buttons in place of email -->
-- [ ] <!-- TODO: explicit deny path with audit record -->
+- [ ] <!-- TODO: explicit deny path with an audit record -->
 - [ ] <!-- TODO: second scenario — scoped S3 access -->
 - [ ] <!-- TODO: CloudWatch dashboard -->
 
@@ -364,7 +603,8 @@ The full click-by-click build guide lives in [`break-glass-phase1.md`](break-gla
 ├── terraform/                 # Infrastructure as code (in progress)
 │   └── main.tf
 └── screenshots/               # Build and test evidence
-    ├── phase_one/             # DynamoDB, permission boundary, EC2 tagging
+    ├── architecture/          # Diagram stills and walkthrough clip
+    ├── phase_one/             # DynamoDB, permission boundary, EC2 prep
     ├── phase_two/             # IAM roles and policies
     └── phase_three/           # Lambda functions
 ```
@@ -373,9 +613,9 @@ The full click-by-click build guide lives in [`break-glass-phase1.md`](break-gla
 
 ## Cost Note
 
-<!-- TODO: Worth a short paragraph. Most of the stack is free-tier friendly, but Security Hub
-     and CloudTrail data events are not. Flag anything a reader reproducing this should know
-     before enabling. -->
+<!-- TODO: Short paragraph. Most of this stack is free-tier friendly, but Security Hub bills
+     per check per account and is easy to leave running. Flag anything someone reproducing
+     this should know before enabling. -->
 
 ---
 
