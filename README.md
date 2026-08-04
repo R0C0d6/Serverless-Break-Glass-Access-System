@@ -42,9 +42,26 @@ A serverless solution for emergency access management.
 
 ## The Problem
 
-<!-- TODO: 2–3 paragraphs. Why standing admin access is a liability; what teams do today
-     (shared root creds, permanent admin roles, a break-glass password in a vault);
-     what goes wrong with those. Keep it concrete — name the failure mode you're preventing. -->
+**This project started as an exam question.**
+
+Sitting the AWS Certified Security – Specialty exam, we hit a scenario that stuck with us. A
+company needed a break-glass identity for when something went badly wrong — and had to reach its
+workloads with **no inbound ports open**. Nothing on 22, no bastion, no SSH keys in circulation.
+The intended answer was Session Manager, and picking it took five seconds. The better question was
+what it takes to actually build it.
+
+Because the real-world version is usually a root password in a sealed envelope, or an
+`AdministratorAccess` role created during an outage two years ago that nobody dares delete. They
+share one defect: the access is **standing**. It exists before the emergency and it is still there
+long after. Nothing expires, nobody approves its use, and the audit trail records that "the
+break-glass account" did something without ever establishing who was holding it — which is exactly
+what an attacker goes looking for first.
+
+So we built it properly: access that does not exist until it is requested, needs a second person
+to approve it, is capped at SSM sessions on tagged instances by a permission boundary, expires on
+a timer, and leaves a per-grant record of who asked, who approved, why, and for how long.
+
+No open ports. No standing privilege. No anonymous emergency account.
 
 ---
 
@@ -69,45 +86,11 @@ Key properties:
 **Region:** `us-east-1`
 **Scenario implemented:** Scenario A — SSM Session Manager access to a tagged EC2 instance.
 
-> **Note:** the diagram below is written in Mermaid. It renders as a picture on GitHub.
-> In VS Code's built-in preview it will look like plain code unless you install the
-> *Markdown Preview Mermaid Support* extension.
+![Architecture — Serverless Break Glass System, Scenario A](screenshots/architecture/architecture-diagram.png)
 
-```mermaid
-flowchart TD
-    ENG([Engineer])
-    APR([Approver])
-
-    ENG -->|1 · submit request| RH[Lambda: RequestHandler]
-
-    RH -->|2 · write status=pending| DDB[(DynamoDB<br/>breakglass-grants)]
-    RH -->|3 · publish| SNS{{SNS<br/>breakglass-approvals}}
-    RH -->|4 · start timer| SFN[Step Functions<br/>BreakGlass-StateMachine]
-
-    SNS -->|5 · approval email| APR
-    APR -->|6 · click approve link| APIGW[API Gateway<br/>GET /approve]
-    APIGW --> AH[Lambda: ApprovalHandler<br/>enforces requester ≠ approver]
-
-    AH -->|7 · AssumeRole + session tags| STS[STS]
-    STS --> ROLE[IAM Role<br/>BreakGlass-ElevatedAccessRole]
-    PB[Permission Boundary<br/>SSM only · tagged instances only] -.->|hard ceiling| ROLE
-    ROLE -->|8 · ssm:StartSession| EC2[EC2 Instance<br/>tag BreakGlassEligible true]
-    AH -->|status=active| DDB
-    AH -->|credentials| SNS
-
-    SFN -->|9 · after grant duration| AR[Lambda: AutoRevoke]
-    AR -->|status=expired| DDB
-    AR --> SNS
-
-    SCHED[EventBridge<br/>rate 5 minutes] --> FS[Lambda: FailsafeScanner]
-    FS -.->|zombie grants| AR
-
-    ROLE -.->|AssumeRole event| CT[CloudTrail]
-    CT --> EB[EventBridge<br/>AssumeRoleAlert]
-    EB --> SNS
-```
-
-<!-- TODO: 1–2 paragraphs walking through the diagram in prose. -->
+<!-- TODO: 1–2 paragraphs walking through the diagram in prose. Trace the path a request
+     takes from left to right: engineer → request handler → approval → STS → SSM session,
+     with the permission boundary sitting over the whole thing. -->
 
 ---
 
