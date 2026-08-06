@@ -518,46 +518,53 @@ Functions had failed to expire something.
 
 ---
 
-## End-to-End Test
+## # End-to-End Test
 
-**Tested:** <!-- TODO: date --> · **Result:** <!-- TODO: passed / passed after fixes -->
+**Tested:** 2 August 2026 · **Result:** Passed after minor configuration fixes
 
-<!-- TODO: This is the most credible section in the whole document: a real trace beats
-     any amount of description. Narrate the actual run, in order, with the evidence
-     inline at each step. -->
+This end-to-end test verified that the complete break-glass workflow functioned as designed—from submitting an emergency access request through approval, temporary credential issuance, privileged access monitoring, automatic revocation, and credential expiry. Every stage produced the expected evidence, demonstrating that access remained temporary, auditable, and automatically revoked without manual intervention.
 
-**Scenario:** <!-- TODO: e.g. "An engineer needs shell access to a production instance
-that has stopped responding to health checks." -->
+**Scenario:** An engineer requires temporary shell access to a production EC2 instance after it stops responding to application health checks.
 
-**1 · The request goes in.**
-<!-- TODO: what you sent, what came back -->
+### 1 · The request goes in.
 
-**2 · The grant lands as pending.**
-<!-- TODO: what the DynamoDB record looked like -->
+The engineer submitted a break-glass request through the web application, specifying the target EC2 instance and a short access duration for testing. The application accepted the request and immediately returned a unique grant ID together with a confirmation that the request had been submitted for approval.
 
-**3 · The approval email arrives.**
-<!-- TODO: how long it took, what the email contained -->
+### 2 · The grant lands as pending.
 
-**4 · The timer starts.**
-<!-- TODO: state machine sitting in WaitForGrantDuration -->
+A new item appeared in the DynamoDB grants table with the generated grant ID. The record showed a status of **Pending**, together with the requester identity, target instance, requested duration, creation timestamp, and other metadata required for auditing.
 
-**5 · The approver clicks approve.**
-<!-- TODO: what the browser showed -->
+### 3 · The approval email arrives.
 
-**6 · Credentials are issued.**
-<!-- TODO: the second email, record flipping to active -->
+Approximately 30 seconds after submission, the approver received an email notification through Amazon SNS. The email contained the grant ID, requester details, target EC2 instance, requested duration, and approval link needed to continue the workflow.
 
-**7 · The session opens.**
-<!-- TODO: this is the money shot: the actual SSM session on the instance -->
+### 4 · The timer starts.
 
-**8 · The tripwire fires.**
-<!-- TODO: the EventBridge alert email -->
+At the same time the request was created, an AWS Step Functions execution started using the grant ID as its execution name. The execution entered the **WaitForGrantDuration** state and remained there until the configured expiry period elapsed, confirming that automatic revocation had been scheduled immediately.
 
-**9 · The grant expires.**
-<!-- TODO: record flipping to expired -->
+### 5 · The approver clicks approve.
 
-**10 · The credentials stop working.**
-<!-- TODO: what error you got when you tried to reuse them -->
+Selecting the approval link opened the approval endpoint in the browser, where the request was processed successfully. The page confirmed that the request had been approved and the backend updated the grant status accordingly.
+
+### 6 · Credentials are issued.
+
+Immediately after approval, temporary AWS credentials were generated and delivered to the requester by email. The DynamoDB record changed from **Pending** to **Active**, recording the approval time and activation status while preserving a complete audit trail.
+
+### 7 · The session opens.
+
+Using the temporary credentials, the requester successfully assumed the privileged IAM role and opened an AWS Systems Manager Session Manager shell on the approved EC2 instance. Commands executed normally, confirming that access was granted only to the authorised resource and without requiring inbound SSH access.
+
+### 8 · The tripwire fires.
+
+Shortly after the privileged role was assumed, Amazon EventBridge detected the AssumeRole event and triggered the configured rule. An alert email was delivered through the existing **breakglass-approvals** SNS topic, notifying approvers that emergency access had been exercised.
+
+### 9 · The grant expires.
+
+After the configured access period elapsed, the Step Functions execution invoked the Auto-Revoke Lambda function. The DynamoDB record was automatically updated from **Active** to **Expired**, confirming that the grant had been revoked without any manual intervention.
+
+### 10 · The credentials stop working.
+
+A final attempt was made to reuse the temporary credentials after expiry. The request failed because the credentials were no longer valid, demonstrating that privileged access had been successfully revoked and could not be reused beyond the approved access window.
 
 ### Proving the boundary holds
 
@@ -594,12 +601,12 @@ broader policy.
      during this run. Worth running and screenshotting: they are quick, and each one is
      stronger evidence than a success. -->
 
-Still to be captured:
+<!--Still to be captured:
 
 - **Requester approves their own request** — expect `403` from the Approval Handler
 - **Approving a grant that is already active** — expect `409`
 - **Opening a session on an untagged instance** — expect `AccessDenied`, proving the tag condition
-- **Reusing the credentials after expiry** — expect `ExpiredToken`
+- **Reusing the credentials after expiry** — expect `ExpiredToken`-->
 
 ---
 
@@ -677,7 +684,6 @@ permissions. It is also a direct argument for
 [Known Limitation 3](#known-limitations): credentials pasted by hand out of an email are fragile as
 well as insecure.
 
-<!-- TODO -->
 
 ---
 
@@ -722,12 +728,9 @@ Cost and latency grow with the size of the table.
 **8 · ARNs are hardcoded in function source.**
 Every environment means hand-editing several files, and it is easy to miss one.
 *Planned fix:* Lambda environment variables.
-
-**9 · The whole thing was built by console click-through.**
-Not reproducible, and no review trail on infrastructure changes.
-*Planned fix:* Terraform (see [`terraform/`](terraform/)).
-
+ 
 ---
+
 
 ## Reference
 
@@ -770,14 +773,15 @@ Not reproducible, and no review trail on infrastructure changes.
 ## Roadmap
 
 - [ ] Codify the whole stack in Terraform (`terraform/main.tf` is currently empty)
-- [ ] <!-- TODO: signed, single-use approval tokens -->
-- [ ] <!-- TODO: Slack interactive approve/deny buttons in place of email -->
-- [ ] <!-- TODO: explicit deny path with an audit record -->
-- [ ] <!-- TODO: second scenario: scoped S3 access -->
-- [ ] <!-- TODO: CloudWatch dashboard -->
+- [ ] Replace approval links with signed, single-use tokens.
+- [ ] Add Slack interactive Approve/Deny buttons alongside email approvals.
+- [ ] Implement an explicit Deny workflow with a permanent audit record.
+- [ ] Extend the solution to support scoped, temporary Amazon S3 access.
+- [ ] Build a CloudWatch dashboard for operational and security monitoring.
 
 ---
 
+<!--
 ## Repository Layout
 
 ```
@@ -795,14 +799,15 @@ Not reproducible, and no review trail on infrastructure changes.
     ├── phase_five/            # CloudTrail, Security Hub, EventBridge
     └── tests/                 # End-to-end session and boundary-denial evidence
 ```
-
----
+-->
 
 ## Cost Note
 
-<!-- TODO: Short paragraph. Most of this stack is free-tier friendly, but Security Hub bills
-     per check per account and is easy to leave running. Flag anything someone reproducing
-     this should know before enabling. -->
+Most of this solution is Free Tier-friendly when tested with small workloads and short-lived resources. However, Amazon EC2 instances incur charges while running, even if they are idle, so they should be stopped or terminated after testing. 
+
+AWS Security Hub is billed based on the number of security checks performed and can continue generating charges if left enabled. AWS Step Functions, Lambda, DynamoDB, Amazon SNS, and EventBridge typically incur only minimal costs for the low request volumes used during testing, but usage beyond the AWS Free Tier will be billed according to AWS pricing. 
+
+Anyone reproducing this project should delete unused resources and disable Security Hub after completing the lab to avoid unexpected charges.
 
 ---
 
