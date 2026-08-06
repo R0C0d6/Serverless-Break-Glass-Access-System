@@ -333,7 +333,7 @@ SNS ties the human element into the loop, dispatching real-time alerts to securi
 #### Step 2 · Replace the SNS placeholders in all three functions
 
 <!-- TODO: how many places needed editing — this is the pain point that argues for
-     environment variables. See Known Limitations #8. -->
+     environment variables. See Known Limitations #8 -->
 
 <!-- TODO: ![...](screenshots/phase_four/...) -->
 
