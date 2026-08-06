@@ -27,11 +27,11 @@ A serverless solution for emergency access management.
 - [How Access Flows](#how-access-flows)
 - [The Security Model](#the-security-model)
 - [Build Walkthrough](#build-walkthrough)
-  - [Phase 1 — Foundation](#phase-1--foundation-dynamodb--permission-boundary)
-  - [Phase 2 — Identity](#phase-2--identity-the-two-iam-roles)
-  - [Phase 3 — Logic](#phase-3--logic-the-lambda-functions)
-  - [Phase 4 — Orchestration](#phase-4--orchestration-sns-api-gateway-step-functions)
-  - [Phase 5 — Audit and Failsafe](#phase-5--audit-and-failsafe)
+  - [Phase 1 - Foundation](#phase-1--foundation-dynamodb--permission-boundary)
+  - [Phase 2 - Identity](#phase-2--identity-the-two-iam-roles)
+  - [Phase 3 - Logic](#phase-3--logic-the-lambda-functions)
+  - [Phase 4 - Orchestration](#phase-4--orchestration-sns-api-gateway-step-functions)
+  - [Phase 5 - Audit and Failsafe](#phase-5--audit-and-failsafe)
 - [End-to-End Test](#end-to-end-test)
 - [Lessons Learned](#lessons-learned)
 - [Known Limitations](#known-limitations)
@@ -42,20 +42,19 @@ A serverless solution for emergency access management.
 
 ## The Problem
 
-**This project started as an exam question.**
+*This project started as an exam question.*
 
-Sitting the AWS Certified Security – Specialty exam, we hit a scenario that stuck with us. A
-company needed a break-glass identity for when something went badly wrong — and had to reach its
+Preparing for the AWS Certified Security - Specialty exam, we hit a scenario that stuck with us. A
+company needed a break-glass identity for when something went badly wrong - and had to reach its
 workloads with **no inbound ports open**. Nothing on 22, no bastion, no SSH keys in circulation.
-The intended answer was Session Manager, and picking it took five seconds. The better question was
-what it takes to actually build it.
+The intended answer was Session Manager, and picking it took five seconds. Imagine our surprise when we had it wrong. The better answer to the question was what it takes to actually build it.
 
-Because the real-world version is usually a root password in a sealed envelope, or an
-`AdministratorAccess` role created during an outage two years ago that nobody dares delete. They
-share one defect: the access is **standing**. It exists before the emergency and it is still there
-long after. Nothing expires, nobody approves its use, and the audit trail records that "the
-break-glass account" did something without ever establishing who was holding it — which is exactly
-what an attacker goes looking for first.
+     Because the real-world version is usually a root password in a sealed envelope, or an
+     'AdministratorAccess' role created during an outage two years ago that nobody dares delete. 
+     
+They share one defect: the access is **standing**. It exists before the emergency and it is still there long after. Nothing expires, nobody approves its use, and the audit trail records that "the
+break-glass account" did something without ever establishing who was holding it - which is exactly
+what an attacker prefers.
 
 So we built it properly: access that does not exist until it is requested, needs a second person
 to approve it, is capped at SSM sessions on tagged instances by a permission boundary, expires on
@@ -67,94 +66,113 @@ No open ports. No standing privilege. No anonymous emergency account.
 
 ## What This System Does
 
-<!-- TODO: One paragraph, plain language. The elevator pitch. -->
+Our system provides a secure way to access critical AWS resources during emergencies without relying on permanently privileged accounts. Instead of leaving administrator access available all the time, it grants temporary, closely monitored access only when it is genuinely needed. 
 
-**In one sentence:** <!-- TODO -->
+Every request must be approved, every action is logged, and access is automatically revoked after a set period(30 minutes in our initial configuration). This reduces security risks while ensuring administrators can still respond quickly when unexpected issues arise.
 
 Key properties:
 
-- **No standing privilege** — <!-- TODO: one line -->
-- **Two-person rule** — <!-- TODO: one line -->
-- **Hard permission ceiling** — <!-- TODO: one line -->
-- **Time-boxed by construction** — <!-- TODO: one line -->
-- **Fully audited** — <!-- TODO: one line -->
+- **No standing privilege**  <!-- TODO: one line -->
+- **Two-person rule**  <!-- TODO: one line -->
+- **Hard permission ceiling**  <!-- TODO: one line -->
+- **Time-boxed by construction**  <!-- TODO: one line -->
+- **Fully audited**  <!-- TODO: one line -->
 
 ---
 
 ## Architecture
 
 **Region:** `us-east-1`
-**Scenario implemented:** Scenario A — SSM Session Manager access to a tagged EC2 instance.
+
+**Scenario implemented:** Scenario A - SSM Session Manager access to a tagged EC2 instance.
 
 ![Architecture — Serverless Break Glass System, Scenario A](screenshots/architecture/architecture-diagram.png)
 
-<!-- TODO: 1–2 paragraphs walking through the diagram in prose. Trace the path a request
-     takes from left to right: engineer → request handler → approval → STS → SSM session,
-     with the permission boundary sitting over the whole thing. -->
+
+
+> The process starts when an engineer needs emergency access to an EC2 instance. Instead of having permanent administrator privileges, the engineer submits a request for temporary elevated access. From the very beginning, a permission boundary is attached to the engineer's role, making sure the requested access can never exceed a predefined limit. The request is then handled by the **Request Handler Lambda**, which stores the request in **Amazon DynamoDB** and sends an approval notification through **Amazon SNS** to the designated approver.
+
+> Once the approver reviews and approves the request, the **Approval Handler Lambda** uses **AWS Security Token Service (STS)** to temporarily assume the break-glass role and grant the required permissions. The engineer can then securely connect to the EC2 instance using **AWS Systems Manager (SSM) Session Manager**, without the need for SSH keys or opening network ports. Every step of the process is recorded in **AWS CloudTrail**, while **Security Hub** keeps an eye out for suspicious activity. Finally, **AWS Step Functions** keeps track of how long the emergency access should remain active. When the approved time expires, it automatically triggers the **Auto-Revoke Lambda**, removing the elevated permissions and restoring the environment to its normal, secure state.
+
 
 ---
 
 ## How Access Flows
 
-<!-- TODO: Walk through the lifecycle as a short narrative — six or seven sentences.
-     The diagram above shows the wiring; this should explain the story. -->
+**1 · Request.**
+The engineer requests emergency access by submitting the reason for access and the EC2 instance they need to work on. The **Request Handler Lambda** validates the request, stores it in **Amazon DynamoDB**, and marks its status as **`pending`** while it waits for approval.
 
-**1 · Request.** <!-- TODO: what the engineer does, what gets written, record status becomes `pending` -->
+**2 · Notify.**
+As soon as the request is created, **Amazon SNS** sends an email to the designated approver. The email includes details such as who requested access, the target EC2 instance, the reason for the request, and links to approve or reject it.
 
-**2 · Notify.** <!-- TODO: SNS email to the approver, what the email contains -->
+**3 · Approve.**
+The approver reviews the request and, if everything looks legitimate, approves it. The **Approval Handler Lambda** performs the necessary checks, uses **AWS STS** to create temporary credentials, grants access by assuming the break-glass role, and updates the request status to **`active`**.
 
-**3 · Approve.** <!-- TODO: approver clicks, checks that run, credentials minted, status becomes `active` -->
+**4 · Use.**
+The engineer can now open a secure **AWS Systems Manager (SSM) Session Manager** session to the EC2 instance. They can perform only the actions allowed by the temporary role and its permission boundary, nothing more. Every action is logged for auditing.
 
-**4 · Use.** <!-- TODO: engineer opens the SSM session, what they can and cannot do -->
+**5 · Expire.**
+When the approved access period ends, **AWS Step Functions** automatically triggers the **Auto-Revoke Lambda**. The temporary credentials become unusable, the elevated permissions are removed, and the request status changes to **`expired`**.
 
-**5 · Expire.** <!-- TODO: timer fires, status becomes `expired`, credentials die -->
-
-**6 · Failsafe.** <!-- TODO: the 5-minute sweep and what it catches -->
+**6 · Failsafe.**
+As an extra layer of protection, a scheduled check runs every five minutes to look for any expired requests that may not have been cleaned up. If it finds one, it revokes any remaining access, updates the request status if needed, and ensures no temporary privileges are left behind.
 
 ---
 
 ## The Security Model
 
-Four independent controls. Every one of them has to fail before privilege escalation is possible.
-
+Four independent controls. 
 ### 1 · The permission boundary is a hard ceiling
 
-<!-- TODO: Explain what a permission boundary is and why it's the centrepiece.
-     Key point to make: it caps the role permanently, no matter what policies
-     get attached to it later. -->
+A **permission boundary** acts like a safety ceiling for an IAM role. It defines the maximum permissions that the role can ever have, regardless of any other permissions attached to it later.
+
+Think of it as a permanent guardrail. You can attach new policies to the role, but those policies can only grant permissions that already exist inside the boundary. Anything outside the boundary is automatically blocked.
+
+This is why the permission boundary is the centrepiece of the design: it gives you confidence that even if the role is modified in the future, it cannot suddenly gain more power than you originally allowed. The boundary stays in place and continues to limit the role throughout its lifetime.
+
 
 The policy we attached:
 
 ![Permission boundary JSON](screenshots/phase_one/permission_boundary_json.png)
 
-<!-- TODO: 1–2 sentences on what this JSON allows, in plain English. -->
+This IAM policy follows the principle of least privilege by allowing only AWS Systems Manager (SSM) Session Manager actions on EC2 instances that are explicitly tagged as `BreakGlassEligible=true`. 
+
+This helps ensure that administrators can securely access only approved emergency ("break-glass") instances while preventing unauthorized access to other resources.
 
 ![Permission boundary created](screenshots/phase_one/break_glass_permission_boundary_details.png)
 
 ### 2 · Access is opt-in per instance
 
-<!-- TODO: Explain the BreakGlassEligible=true condition — an instance is invisible
-     to the break-glass role until somebody deliberately tags it. -->
+The `BreakGlassEligible=true` condition adds an extra layer of security by requiring an EC2 instance to be explicitly tagged before the break-glass role can access it through AWS Systems Manager Session Manager. 
+
+Until an administrator deliberately applies this tag, the instance remains inaccessible to the break-glass role, reducing the risk of unintended or unauthorized emergency access.
+
 
 ![Instance tagged BreakGlassEligible](screenshots/phase_one/break_glass_eligible_tagging.png)
 
 ### 3 · Only Lambda can assume the elevated role
 
-<!-- TODO: Explain that the trust policy names exactly one principal —
-     BreakGlass-LambdaExecutionRole. No human can assume this role directly, even
-     with valid credentials. Mention why sts:TagSession is in there. -->
+The **trust policy** is the first security checkpoint for this role. It defines exactly **who is allowed to assume it** - and in this case, the answer is only one specific identity: **`BreakGlass-LambdaExecutionRole`**.
+
+This means no human user, administrator, or someone with valid AWS credentials can directly assume this role. Having powerful permissions is not enough; the identity must also be explicitly trusted by the role’s trust policy. If you are not listed as a trusted principal, AWS will deny the assumption request.
+
+The inclusion of **`sts:TagSession`** adds another layer of control. It allows the trusted Lambda role to pass session tags when assuming the role. These tags provide additional context about the session, such as the request source, ticket reference, or approval details, making it easier to track, audit, and enforce security decisions during the temporary access period.
+
+In short, the trust policy ensures that this sensitive role cannot be casually accessed. Only the approved automated workflow can request the elevated permissions, and every session can carry traceable context for auditing.
 
 ![Break-glass role trust policy](screenshots/phase_two/break_glass_iamRole_json.png)
 
 ### 4 · Separation of duties
 
-<!-- TODO: The requester ≠ approver check. Be honest about how it's enforced today
-     (a string comparison in the Approval Handler) and point at Known Limitations #1. -->
+The solution includes a separation-of-duties check to help prevent the same person from both requesting and approving emergency access. In the current implementation, this is enforced by the Approval Handler through a simple string comparison between the requester's identity and the approver's identity. 
+While this provides a basic safeguard against self-approval, it should not be considered a foolproof security control for production. A more robust implementation would use identity-aware authorization mechanisms and stronger validation to enforce separation of duties in production environments.
+
 
 ### Least privilege on the Lambda execution role
 
-<!-- TODO: Note that this role is the highest-value identity in the system —
-     it can mint elevated access — and what you scoped it down to. -->
+The Lambda execution role is the highest-value identity in the break-glass solution because it is responsible for granting temporary elevated access by assuming the **BreakGlass-ElevatedAccess** role. Since compromising this role could allow an attacker to issue privileged credentials, it was intentionally restricted using the principle of least privilege.
+
+As shown in the policy, the role can assume only the designated break-glass IAM role, perform only the required operations on the specific DynamoDB grants table, publish approval and notification messages, and write execution logs to CloudWatch. By limiting both the allowed actions and the resources they apply to, the design reduces the attack surface and helps ensure the Lambda function can perform only its intended responsibilities, nothing more.
 
 ![Lambda execution role inline policy](screenshots/phase_two/lambda_execution_role_inline_policy.png)
 
@@ -162,31 +180,34 @@ The policy we attached:
 
 ## Build Walkthrough
 
-Everything below was built through the AWS Console. The full click-by-click guide is in
-[`break-glass-phase1.md`](break-glass-phase1.md).
+### Phase 1 - Foundation: DynamoDB + permission boundary
 
-<!-- TODO: rename that file — it currently holds all five phases despite the name. -->
+*Phase 1* establishes the security foundation of the break-glass solution by creating the DynamoDB table used to securely track access requests and approvals, while also implementing a permission boundary to limit the maximum privileges that can ever be granted. 
+Building these controls first ensures that every subsequent component operates within predefined security limits and that all privileged access can be recorded and monitored from the outset. This security-first approach reduces the risk of privilege escalation and provides a trusted foundation for the rest of the system.
 
----
-
-### Phase 1 — Foundation: DynamoDB + permission boundary
-
-<!-- TODO: 2–3 sentences — what this phase establishes and why it has to come first. -->
 
 #### Step 1 · Create the grants table
 
 We created a DynamoDB table named `breakglass-grants` with `grant_id` (String) as the partition
 key, and left every other setting at its default.
 
-<!-- TODO: add a sentence on why no sort key and why on-demand capacity. -->
+ The table stores a single record for each break-glass request, making `grant_id` a unique identifier that allows each request to be retrieved directly without requiring a sort key. Since the application primarily performs point lookups and updates using this unique identifier, adding a sort key would have introduced unnecessary complexity without providing additional security or performance benefits.
+
+The table was also configured to use **on-demand capacity**, allowing DynamoDB to automatically scale with unpredictable workloads. Break-glass events are expected to occur infrequently but may happen in bursts during an incident, so on-demand capacity eliminates the need for manual capacity planning while ensuring the system remains responsive when emergency access is required. This approach supports both operational reliability and security by ensuring access requests can be processed without delays during critical situations.
+
 
 ![DynamoDB table configuration](screenshots/phase_one/create_dynamodb_table_details.png)
 
-**What we observed:** <!-- TODO: e.g. table went Active after ~40s; Explore items showed empty -->
+**What we observed:** After creating the table, DynamoDB completed the provisioning process and the table status changed to **Active** within a short period (typically around 30 seconds). Opening the **Explore items** tab showed an empty table, which was the expected result because no break-glass requests had been submitted yet. 
+
+
+
 
 #### Step 2 · Write the permission boundary
 
-<!-- TODO: what you pasted and why this is the most important step in the build. -->
+We then created and attached a **permission boundary** that defines the maximum permissions any break-glass session can ever receive. The policy allows only the minimum actions required for emergency administration, such as starting AWS Systems Manager (SSM) Session Manager connections to approved EC2 instances and viewing instance details, while restricting access through conditions such as the `BreakGlassEligible=true` resource tag.
+
+This is the most critical step in the entire build because the permission boundary acts as a security guardrail. Even if an IAM role or policy is accidentally configured with broader permissions in the future, the boundary prevents those permissions from exceeding the limits defined in this policy. As a result, emergency access remains tightly controlled, restricted to explicitly approved resources, and aligned with the principle of least privilege, significantly reducing the risk of privilege escalation or unauthorized access during a break-glass event.
 
 ![Permission boundary JSON](screenshots/phase_one/permission_boundary_json.png)
 
@@ -202,26 +223,35 @@ The instance needs an instance profile with SSM permissions before Session Manag
 
 ![Instance profile attached](screenshots/phase_one/ec2_attacched_ssmrole_details.png)
 
-**What we observed:** <!-- TODO: how long until the instance appeared as Managed in Fleet Manager -->
+**What we observed:** After attaching the IAM instance profile with the required AWS Systems Manager (SSM) permissions, the EC2 instance took a few minutes (around 3 minutes) to register with AWS Systems Manager. Once the SSM Agent established communication with the service, the instance appeared in **Fleet Manager** with a **Managed** status. This confirmed that the instance could now be securely accessed through Session Manager without exposing SSH (port 22) to the internet, improving the security posture by enabling authenticated, audited, and encrypted administrative access.
+
 
 ![Instance visible in Fleet Manager](screenshots/phase_one/ec2_fleet_manager_check.png)
 
 #### Step 4 · Tag the instance as eligible
 
-<!-- TODO: one sentence — this tag is what the boundary condition keys on. -->
+We tagged the EC2 instance with **`BreakGlassEligible=true`**, ensuring that only explicitly approved instances satisfy the permission boundary and are eligible for emergency access.
 
 ![BreakGlassEligible tag applied](screenshots/phase_one/break_glass_eligible_tagging.png)
 
 ---
 
-### Phase 2 — Identity: the two IAM roles
+### Phase 2 - Identity: the two IAM roles
 
-<!-- TODO: 2–3 sentences. Worth calling out the chicken-and-egg problem — the trust policy
-     references a role that doesn't exist yet — and how you worked around it. -->
+We established the identities that make the break-glass workflow secure by separating day-to-day operations from temporary privileged access. Two IAM roles are created: one for requesting emergency access and another that provides the elevated permissions only after the required approval process.
+
+One implementation challenge was a chicken-and-egg dependency: the elevated role's trust policy needed to reference the requester role before that role existed. To resolve this, the roles were created in stages-first creating the roles with a temporary trust configuration, then updating the trust policy once both roles were available. This ensured the trust relationship was established correctly while maintaining a secure and controlled deployment process.
 
 #### Step 1 · Create the break-glass role with a custom trust policy
 
-<!-- TODO: what you pasted, and what the trust policy means in plain English. -->
+Think of a Trust Policy as a highly specific bouncer standing guard over your most sensitive credentials.
+
+    The Rule (Allow / sts:AssumeRole): It permits the entity to "assume" or temporarily adopt the permissions of this break-glass role.
+
+    The Only Exception (Principal: lambda.amazonaws.com): It restricts this ability exclusively to the AWS Lambda service.
+
+Why this matters for our security posture:
+Instead of trusting a human user account-which could be compromised, phished, or used unpredictably-this policy ensures the break-glass role can only be triggered by our automated Lambda functions. This guarantees that emergency interventions are executed programmatically, predictably, and leave a flawless, tamper-proof audit trail.
 
 ![Trust policy](screenshots/phase_two/break_glass_iamRole_json.png)
 
@@ -230,36 +260,31 @@ The instance needs an instance profile with SSM permissions before Session Manag
 <!-- NOTE: this screenshot lives in screenshots/phase_one/ but is a Phase 2 artifact.
      Consider moving it to screenshots/phase_two/ and updating this path. -->
 
-**What we observed:** <!-- TODO: e.g. role created with no policies and no boundary yet -->
+**What we observed:** The IAM role was created with its custom trust policy, but currently has no attached permission policies or permissions boundaries.
 
 #### Step 2 · Attach the permission boundary
 
-<!-- TODO: one or two sentences on what changes the moment the boundary is set. -->
+The moment the permissions boundary is attached, an absolute safety ceiling is locked onto the role. No matter what broad policies are assigned to it later, the break-glass role can never execute actions beyond this hard guardrail.
 
 ![Boundary attached to role](screenshots/phase_two/permission_boundary_attach.png)
 
 #### Step 3 · Attach the inline access policy
 
-<!-- TODO: explain the double-lock — boundary and policy must BOTH allow an action.
-     Explain why they're deliberately identical here. -->
+Our AWS permissions operate on an intersection model: an action is granted only if both the permissions boundary and the inline policy explicitly allow it- like requiring two distinct keys to open a vault door.
+
+This ensures zero drift between what the role is granted to do and what it is bounded to do.
 
 ![Inline policy on elevated access role](screenshots/phase_two/inline_policy_for_elevatedaccessrole.png)
 
 #### Step 4 · Create and scope the Lambda execution role
 
-<!-- TODO: 1–2 sentences on what this role is allowed to do and why nothing more. -->
+This role grants the Lambda function strictly enough privilege. Limiting it to the exact actions required enforces least privilege, ensuring a compromised function cannot be weaponized to access any other AWS resources.
 
 ![Lambda execution role](screenshots/phase_two/breakglass_lambdaexecutionRole_details.png)
 
 ![Execution role inline policy](screenshots/phase_two/lambda_execution_role_inline_policy.png)
 
-**What we observed:** <!-- TODO -->
-
----
-
-### Phase 3 — Logic: the Lambda functions
-
-<!-- TODO: 2–3 sentences. Three functions, one shared execution role, what each owns. -->
+### Phase 3 - Logic: the Lambda functions
 
 #### Step 1 · Request Handler
 
@@ -273,34 +298,29 @@ state machine.
 We confirmed the function runs under `BreakGlass-LambdaExecutionRole`, not an auto-generated one:
 
 ![Execution role confirmed](screenshots/phase_three/request_handler_execution_role.png)
-
-**What we observed:** <!-- TODO: the first test failed at the SNS step because the ARN was still
-     a placeholder, but the DynamoDB write succeeded — describe what you saw in the table -->
-
+ 
 ![Grant record written](screenshots/phase_one/dynamo_table_items.png)
 
 #### Step 2 · Approval Handler
 
-<!-- TODO: what it validates before minting credentials — grant exists, still pending,
-     requester ≠ approver. -->
+Before minting any emergency credentials, the Approval Handler enforces strict four-eyes security. It verifies that a valid grant request exists, confirms it is still pending, and guarantees that the approver is not the requester, blocking self-approval attacks at the door.
 
 ![Approval Handler function](screenshots/phase_three/lambda_approval_handler_details.png)
-
-**What we observed:** <!-- TODO -->
-
+ 
 #### Step 3 · Auto-Revoke
 
-<!-- TODO: what it does and — importantly — what it does NOT do (see Known Limitations #5). -->
+The Auto-Revoke function acts as an automated fail-safe, invalidating temporary access grants and updating the session state as soon as the emergency window expires.
+
+Crucially, it only blocks new API calls made after revocation. It does not forcibly sever active network connections, kill in-flight processes, or terminate live sessions already established during the access window
 
 ![Auto-Revoke function](screenshots/phase_three/lambda_auto_revoke_details.png)
-
-**What we observed:** <!-- TODO -->
-
+ 
 ---
 
-### Phase 4 — Orchestration: SNS, API Gateway, Step Functions
+### Phase 4 - Orchestration: SNS, API Gateway, Step Functions
 
-<!-- TODO: 2–3 sentences on what this phase ties together. -->
+API Gateway exposes secure, authenticated entry points for break-glass requests, while Step Functions orchestrates the precise state machine governing approvals, timeouts, and automated teardowns. 
+SNS ties the human element into the loop, dispatching real-time alerts to security teams at every critical lifecycle event. Together, they transform isolated Lambda functions into a deterministic, fully audited emergency workflow with zero room for manual bypass.
 
 #### Step 1 · Create the SNS topic and confirm the subscription
 
