@@ -335,12 +335,11 @@ sends. Until then SNS accepts publishes and silently drops them: no error anywhe
 
 ![Subscription confirmed](screenshots/phase_four/sns_confirmd_subscription.png)
 
-**What we observed:** <!-- TODO: how long the confirmation email took to arrive -->
+**What we observed:** The confirmation email arrived within about 30 Seconds. Until the confirmation link was clicked, the subscription remained in Pending confirmation, and although Amazon SNS accepted published messages, no emails were delivered. Once confirmed, the subscription status changed to Confirmed, and subsequent notifications were delivered successfully.
 
 #### Step 2 · Replace the SNS placeholders in all three functions
 
-<!-- TODO: note how many separate edits this took: this is the pain point that argues for
-     environment variables. See Known Limitations #8 -->
+We had to update the SNS topic ARN in three separate functions. Although the change was straightforward, repeating the same edit across multiple files increased the risk of inconsistencies. Using environment variables would eliminate this duplication, making future updates faster, safer, and easier to maintain.
 
 ![Lambdas updated with the real SNS topic ARN](screenshots/phase_four/updated_lambdas_with_sns_topic.png)
 
@@ -392,7 +391,7 @@ glance.
 
 ![State machine definition](screenshots/phase_four/state_machine_code.png)
 
-**What we observed:** <!-- TODO: describe the 10-second test run -->
+**What we observed:** For testing, we set wait_seconds to 10. The state machine entered the Wait state, paused for approximately 10 seconds, then automatically transitioned to the Auto-Revoke Lambda function. The execution completed successfully, and the temporary access grant was revoked exactly as expected, confirming that the timed revocation workflow operated correctly.
 
 ![Execution with a 10 second wait](screenshots/phase_four/state_machine_graph_10seconds.png)
 
@@ -413,8 +412,7 @@ can never start two timers for the same grant.
 
 ![Request Handler starting the state machine](screenshots/phase_four/updated_request_handler-state-machine.png)
 
-**What we observed:** <!-- TODO: all three things firing at once: the DynamoDB record, the
-     approval email, and a waiting Step Functions execution -->
+**What we observed:** As soon as the request was submitted, three actions occurred almost simultaneously: a new grant request was written to DynamoDB, an approval notification email was sent through Amazon SNS, and a Step Functions execution started and entered its waiting state. Using the grant ID as the execution name ensured that retries could not create duplicate timer executions for the same grant, providing an additional layer of reliability.
 
 ---
 
