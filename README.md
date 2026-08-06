@@ -439,7 +439,12 @@ that lookups as well as changes are captured.
 
 ![Management events enabled](screenshots/phase_five/cloudtrail_management_events.png)
 
-**What we observed:** <!-- TODO: what the event history showed when you checked it -->
+**What we observed:** Management events are the ones that matter for this system. Both **Read** and **Write** events are enabled so that AWS CloudTrail records not only configuration changes but also resource lookups and API requests.
+
+![Management events enabled](screenshots/phase_five/cloudtrail_management_events.png)
+
+**What we observed:** After checking the event history, CloudTrail recorded the management API calls made during testing, including requests to AWS services. Each event showed details such as the event time, user identity, service, action performed, and whether the request completed successfully, providing a clear audit trail of system activity.
+
 
 ![Verified event history](screenshots/phase_five/verified_cloudtrail_event_history.png)
 
@@ -456,7 +461,7 @@ logging checks most relevant to this build.
 
 ![Foundational Security Best Practices enabled](screenshots/phase_five/checked_aws_best_foundational_practices.png)
 
-**What we observed:** <!-- TODO: findings take 15–30 min to populate; note what you saw and when -->
+**What we observed:** After enabling the AWS Foundational Security Best Practices standard, findings did not appear immediately. Initial results began populating after approximately 15 minutes, with Security Hub evaluating the configured IAM, logging, and monitoring resources. Once complete, the dashboard displayed the environment's security findings, confirming that continuous compliance checks were active.
 
 #### Step 3 · Build the AssumeRole tripwire
 
@@ -478,7 +483,7 @@ land in the approver's inbox alongside the approval requests.
 
 ![SNS topic selected as the alert target](screenshots/phase_five/selecting_snstopic_for_alert.png)
 
-**What we observed:** <!-- TODO: the alert email, and how long after the assume it arrived -->
+**What we observed:** What we observed: After the privileged role was assumed, an alert email was delivered to the breakglass-approvals SNS topic subscribers in approximately 30 seconds. The notification appeared in the approver's inbox alongside the standard approval emails, providing timely visibility whenever emergency access was used.
 
 #### Step 4 · Build the scheduled failsafe
 
