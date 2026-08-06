@@ -324,50 +324,97 @@ SNS ties the human element into the loop, dispatching real-time alerts to securi
 
 #### Step 1 · Create the SNS topic and confirm the subscription
 
-<!-- TODO: what you created; note that an unconfirmed subscription fails silently. -->
+We created a Standard topic named `breakglass-approvals` — the single channel every notification
+in the system flows through: approval requests, credential handoffs, revocations and tripwire
+alerts.
 
-<!-- TODO: ![SNS topic](screenshots/phase_four/...) -->
+![SNS topic details](screenshots/phase_four/sns_topic_details_01.png)
 
-**What we observed:** <!-- TODO -->
+An email subscription stays in *Pending confirmation* until the recipient clicks the link AWS
+sends. Until then SNS accepts publishes and silently drops them — no error anywhere.
+
+![Subscription confirmed](screenshots/phase_four/sns_confirmd_subscription.png)
+
+**What we observed:** <!-- TODO: how long the confirmation email took to arrive -->
 
 #### Step 2 · Replace the SNS placeholders in all three functions
 
-<!-- TODO: how many places needed editing — this is the pain point that argues for
+<!-- TODO: note how many separate edits this took — this is the pain point that argues for
      environment variables. See Known Limitations #8. -->
 
-<!-- TODO: ![...](screenshots/phase_four/...) -->
+![Lambdas updated with the real SNS topic ARN](screenshots/phase_four/updated_lambdas_with_sns_topic.png)
 
 #### Step 3 · Build the approval endpoint in API Gateway
 
-<!-- TODO: REST API, /approve resource, GET method, Lambda proxy integration, prod stage. -->
+A REST API gives the approver something clickable. The `/approve` resource takes `grant_id` and
+`approver` as query-string parameters and hands the whole request to the Approval Handler via
+Lambda proxy integration.
 
-<!-- TODO: ![...](screenshots/phase_four/...) -->
+![API Gateway configuration](screenshots/phase_four/api_gateway_details_001.png)
 
-**What we observed:** <!-- TODO: hitting the URL with a fake grant_id returned "Grant not found",
-     which proved the wiring worked -->
+![GET method wired to the Approval Handler](screenshots/phase_four/method_for_approvalhandler.png)
+
+![Method details](screenshots/phase_four/api_method_details.png)
+
+Nothing is reachable until the API is deployed to a stage:
+
+![Deploying to the prod stage](screenshots/phase_four/api_deployment.png)
+
+![Invoke URL](screenshots/phase_four/api_method_invoke_url_details.png)
+
+**What we observed:** hitting the invoke URL with a made-up `grant_id` returned
+`{"error": "Grant not found"}`. That error is the success signal — it proves API Gateway reached
+the Lambda and the Lambda ran its DynamoDB lookup. A wiring failure would have returned a 403 or
+502 from the gateway instead.
+
+![Expected failure — Grant not found](screenshots/phase_four/invoke_url_expected_failure.png)
 
 #### Step 4 · Put the real approval link in the email
 
-<!-- TODO -->
+With a live invoke URL, the Request Handler's email body was updated to embed a clickable approve
+link carrying the grant ID.
 
-<!-- TODO: ![Approval email received](screenshots/phase_four/...) -->
+![Request Handler updated with the approval URL](screenshots/phase_four/modified_request_handler_with_url.png)
+
+**What we observed:** the function ran clean end to end for the first time — `statusCode 200` with
+a real `grant_id` and `status: pending`, no SNS placeholder error.
+
+![Successful Request Handler test](screenshots/phase_four/success_test_for_request_handler.png)
+
+<!-- NOTE: if this screenshot was actually taken after Step 6 rather than Step 4,
+     move it down to Step 6 — it works as evidence for either. -->
 
 #### Step 5 · Build the Step Functions state machine
 
-<!-- TODO: what the machine does — wait, then invoke Auto-Revoke. -->
+The state machine is the timer. It reads `wait_seconds` from its input, waits, then invokes
+Auto-Revoke with the grant ID. Two states, no branching — deliberately small enough to audit at a
+glance.
 
-<!-- TODO: ![State machine definition](screenshots/phase_four/...) -->
+![State machine definition](screenshots/phase_four/state_machine_code.png)
 
-**What we observed:** <!-- TODO: the test execution with wait_seconds=10 -->
+**What we observed:** <!-- TODO: describe the 10-second test run -->
 
-<!-- TODO: ![Execution graph](screenshots/phase_four/...) -->
+![Execution with a 10 second wait](screenshots/phase_four/state_machine_graph_10seconds.png)
+
+![Execution detail](screenshots/phase_four/state_machine_execution.png)
+
+![Execution graph](screenshots/phase_four/state_machine_execution_graph.png)
 
 #### Step 6 · Wire the Request Handler to start the state machine
 
-<!-- TODO: the extra IAM permission needed, and the code change. -->
+The Request Handler could write to DynamoDB and publish to SNS, but nothing started the timer. That
+needed two changes: a new `states:StartExecution` permission on the execution role, scoped to this
+one state machine —
 
-**What we observed:** <!-- TODO: all three things firing at once — DynamoDB record, email,
-     and a waiting execution -->
+![Execution role with StartExecution permission](screenshots/phase_four/wired_lambda_execution_role.png)
+
+— and the `start_execution` call itself, using the grant ID as the execution name so a retry can
+never start two timers for the same grant.
+
+![Request Handler starting the state machine](screenshots/phase_four/updated_request_handler-state-machine.png)
+
+**What we observed:** <!-- TODO: all three things firing at once — the DynamoDB record, the
+     approval email, and a waiting Step Functions execution -->
 
 ---
 
@@ -609,7 +656,9 @@ Not reproducible, and no review trail on infrastructure changes.
     ├── architecture/          # Diagram stills and walkthrough clip
     ├── phase_one/             # DynamoDB, permission boundary, EC2 prep
     ├── phase_two/             # IAM roles and policies
-    └── phase_three/           # Lambda functions
+    ├── phase_three/           # Lambda functions
+    ├── phase_four/            # SNS, API Gateway, Step Functions
+    └── phase_five/            # CloudTrail, Security Hub, EventBridge
 ```
 
 ---
