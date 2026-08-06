@@ -556,26 +556,47 @@ that has stopped responding to health checks." -->
 **10 · The credentials stop working.**
 <!-- TODO: what error you got when you tried to reuse them -->
 
-### Negative tests
+### Proving the boundary holds
 
-<!-- TODO: These are what prove the controls actually bite. Each one is worth a
-     screenshot of the denial: a denied action is stronger evidence than a
-     successful one. -->
+A working session only shows that access was granted. What matters more is what that access
+*cannot* do. With the break-glass credentials loaded and a live session open on the instance, we
+deliberately tried actions outside the boundary.
 
-**Requester tries to approve their own request.**
-Expected `403`. <!-- TODO: observed + screenshot -->
+Setting up the client first, including the Session Manager plugin the CLI needs to open a session
+at all:
 
-**Approving a grant that is already active.**
-Expected `409`. <!-- TODO: observed + screenshot -->
+![Configuring credentials and installing the Session Manager plugin](screenshots/tests/installing_ssh_plugin.jpg)
 
-**Opening a session on an untagged instance.**
-Expected `AccessDenied`. <!-- TODO: observed + screenshot -->
+Then the session itself, followed by the denials:
 
-**Calling a non-SSM API with the break-glass credentials.**
-Expected `AccessDenied`: this is the boundary doing its job. <!-- TODO: observed + screenshot -->
+![Session opened, then non-SSM calls denied](screenshots/tests/successful_session_started.jpg)
 
-**Reusing the credentials after expiry.**
-Expected `ExpiredToken`. <!-- TODO: observed + screenshot -->
+Reading that session in order:
+
+| Action | Result | What it proves |
+|---|---|---|
+| `aws sts get-caller-identity` | `assumed-role/BreakGlass-ElevatedAccessRole/breakglass-…` | The role really was assumed, and the session name carries the grant ID |
+| `aws ec2 describe-instances --filters Name=tag:BreakGlassEligible,Values=true` | returned the tagged instance | The one permitted lookup works |
+| `aws ssm start-session --target i-0c71…` | `Starting session with SessionId: breakglass-…` | The intended capability works after the boundary fix |
+| `aws s3 ls` | `AccessDenied` on `s3:ListAllMyBuckets` | S3 is outside the boundary |
+| `aws iam list-users` | `AccessDenied` on `iam:ListUsers` | IAM is outside the boundary, so the session cannot escalate itself |
+| `whoami` | `ssm-user` | The shell runs as the unprivileged Session Manager user, not `root` |
+
+The two `AccessDenied` responses are the whole point of the exercise. The session is live and the
+credentials are valid, yet S3 and IAM are both refused. `iam:ListUsers` matters most: a session
+that cannot read IAM cannot begin to map a privilege-escalation path, let alone attach itself a
+broader policy.
+
+<!-- TODO: the checks below are enforced in code and by the boundary but were not captured
+     during this run. Worth running and screenshotting: they are quick, and each one is
+     stronger evidence than a success. -->
+
+Still to be captured:
+
+- **Requester approves their own request** — expect `403` from the Approval Handler
+- **Approving a grant that is already active** — expect `409`
+- **Opening a session on an untagged instance** — expect `AccessDenied`, proving the tag condition
+- **Reusing the credentials after expiry** — expect `ExpiredToken`
 
 ---
 
@@ -583,28 +604,75 @@ Expected `ExpiredToken`. <!-- TODO: observed + screenshot -->
 
 ### SSM Session Manager needs the session document in the boundary
 
-**Symptom.** <!-- TODO: what the error actually said, verbatim if you have it. This is the
-     problem that cost you the most time during testing; describe it properly. -->
+**Symptom.** The approval flow worked end to end. Credentials were issued, `aws sts
+get-caller-identity` confirmed the break-glass role had been assumed, and `ec2:DescribeInstances`
+correctly returned the tagged instance. But the actual session refused to open:
 
-**Diagnosis.** `ssm:StartSession` authorises against *two* resources, not one: the target EC2
-instance **and** the Session Manager document (`SSM-SessionManagerRunShell`). The permission
-boundary as originally written only allowed the instance, so the call was denied at the document.
-The `ssm:resourceTag/BreakGlassEligible` condition also cannot apply to a document ARN, which is
-why the document needs its own statement rather than being folded into the existing one.
-
-**Fix.**
-
-```json
-<!-- TODO: paste the corrected boundary statement -->
+```
+An error occurred (AccessDeniedException) when calling the StartSession operation:
+User: arn:aws:sts::<account>:assumed-role/BreakGlass-ElevatedAccessRole/breakglass-3bc6c9ef
+is not authorized to perform: ssm:StartSession
+on resource: arn:aws:ssm:us-east-1:<account>:document/SSM-SessionManagerRunShell
+because no identity-based policy allows the ssm:StartSession action
 ```
 
-<!-- TODO: ![Corrected boundary](screenshots/...) -->
+![StartSession denied on the session document](screenshots/tests/policy_issue_error.jpg)
 
-**Takeaway.** <!-- TODO: 1–2 sentences. Something like: a permission boundary is only as good as
-     your understanding of which resources an API call actually touches, and the docs don't
-     always make that obvious. -->
+Everything upstream said the permissions were correct, which is what made this confusing.
 
-### <!-- TODO: second lesson, if you have one -->
+**Diagnosis.** Read the resource in that error carefully: it is not the EC2 instance, it is
+`document/SSM-SessionManagerRunShell`. `ssm:StartSession` authorises against *two* resources, not
+one: the target instance **and** the Session Manager document that defines what the session may
+do. Our boundary allowed only the instance, so the call was denied at the document.
+
+The document also cannot be covered by the same statement, because the
+`ssm:resourceTag/BreakGlassEligible` condition has nothing to match on a document ARN. Folding it
+into the existing statement would silently deny it again.
+
+**Fix.** A second statement in the permission boundary, allowing `ssm:StartSession` on the session
+document ARNs and carrying no tag condition:
+
+```json
+{
+  "Sid": "AllowSessionDocument",
+  "Effect": "Allow",
+  "Action": "ssm:StartSession",
+  "Resource": [
+    "arn:aws:ssm:*:*:document/SSM-SessionManagerRunShell",
+    "arn:aws:ssm:*:*:document/AWS-StartSSHSession"
+  ]
+}
+```
+
+<!-- TODO: replace the block above with the exact statement you added, if it differs. -->
+
+The instance-scoped statement stays exactly as it was, so the tag condition still governs *which
+machine* can be reached. The new statement only unblocks the document that the session runs
+through.
+
+**Takeaway.** A permission boundary is only as good as your understanding of which resources an API
+call actually touches, and a single API call can touch more than one. The denial message names the
+exact resource that failed, so read it literally rather than assuming you know which resource was
+meant.
+
+### Temporary credentials break if a newline sneaks into the token
+
+**Symptom.** Before the policy fix, an earlier attempt failed differently. Every AWS CLI call
+returned `An HTTP Client raised an unhandled exception: Invalid header value` rather than any AWS
+error at all.
+
+![Invalid header value](screenshots/tests/error_due_to_policy_issues.jpg)
+
+**Diagnosis.** This is not an AWS problem. A session token copied out of the notification email
+carried a trailing newline into the `export` statement, and a newline is not a legal character in
+an HTTP header. The request never left the machine, so AWS never saw it and never had a chance to
+allow or deny it.
+
+**Takeaway.** An error raised by the HTTP client rather than by AWS means the request was malformed
+locally. Worth recognising quickly, because it looks alarming and has nothing to do with your
+permissions. It is also a direct argument for
+[Known Limitation 3](#known-limitations): credentials pasted by hand out of an email are fragile as
+well as insecure.
 
 <!-- TODO -->
 
@@ -721,7 +789,8 @@ Not reproducible, and no review trail on infrastructure changes.
     ├── phase_two/             # IAM roles and policies
     ├── phase_three/           # Lambda functions
     ├── phase_four/            # SNS, API Gateway, Step Functions
-    └── phase_five/            # CloudTrail, Security Hub, EventBridge
+    ├── phase_five/            # CloudTrail, Security Hub, EventBridge
+    └── tests/                 # End-to-end session and boundary-denial evidence
 ```
 
 ---
