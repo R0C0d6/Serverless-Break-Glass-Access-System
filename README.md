@@ -27,11 +27,11 @@ A serverless solution for emergency access management.
 - [How Access Flows](#how-access-flows)
 - [The Security Model](#the-security-model)
 - [Build Walkthrough](#build-walkthrough)
-  - [Phase 1 - Foundation](#phase-1--foundation-dynamodb--permission-boundary)
-  - [Phase 2 - Identity](#phase-2--identity-the-two-iam-roles)
-  - [Phase 3 - Logic](#phase-3--logic-the-lambda-functions)
-  - [Phase 4 - Orchestration](#phase-4--orchestration-sns-api-gateway-step-functions)
-  - [Phase 5 - Audit and Failsafe](#phase-5--audit-and-failsafe)
+  - [Phase 1 - Foundation](#phase-1---foundation-dynamodb--permission-boundary)
+  - [Phase 2 - Identity](#phase-2---identity-the-two-iam-roles)
+  - [Phase 3 - Logic](#phase-3---logic-the-lambda-functions)
+  - [Phase 4 - Orchestration](#phase-4---orchestration-sns-api-gateway-step-functions)
+  - [Phase 5 - Audit and Failsafe](#phase-5---audit-and-failsafe)
 - [End-to-End Test](#end-to-end-test)
 - [Lessons Learned](#lessons-learned)
 - [Known Limitations](#known-limitations)
@@ -50,8 +50,8 @@ workloads with **no inbound ports open**. Nothing on 22, no bastion, no SSH keys
 The intended answer was Session Manager, and picking it took five seconds. Imagine our surprise when we had it wrong. The better answer to the question was what it takes to actually build it.
 
      Because the real-world version is usually a root password in a sealed envelope, or an
-     'AdministratorAccess' role created during an outage two years ago that nobody dares delete. 
-     
+     'AdministratorAccess' role created during an outage two years ago that nobody dares delete.
+
 They share one defect: the access is **standing**. It exists before the emergency and it is still there long after. Nothing expires, nobody approves its use, and the audit trail records that "the
 break-glass account" did something without ever establishing who was holding it - which is exactly
 what an attacker prefers.
@@ -66,7 +66,7 @@ No open ports. No standing privilege. No anonymous emergency account.
 
 ## What This System Does
 
-Our system provides a secure way to access critical AWS resources during emergencies without relying on permanently privileged accounts. Instead of leaving administrator access available all the time, it grants temporary, closely monitored access only when it is genuinely needed. 
+Our system provides a secure way to access critical AWS resources during emergencies without relying on permanently privileged accounts. Instead of leaving administrator access available all the time, it grants temporary, closely monitored access only when it is genuinely needed.
 
 Every request must be approved, every action is logged, and access is automatically revoked after a set period(30 minutes in our initial configuration). This reduces security risks while ensuring administrators can still respond quickly when unexpected issues arise.
 
@@ -86,7 +86,7 @@ Key properties:
 
 **Scenario implemented:** Scenario A - SSM Session Manager access to a tagged EC2 instance.
 
-![Architecture — Serverless Break Glass System, Scenario A](screenshots/architecture/architecture-diagram.png)
+![Architecture: Serverless Break Glass System, Scenario A](screenshots/architecture/architecture-diagram.png)
 
 
 
@@ -121,7 +121,7 @@ As an extra layer of protection, a scheduled check runs every five minutes to lo
 
 ## The Security Model
 
-Four independent controls. 
+Four independent controls.
 ### 1 · The permission boundary is a hard ceiling
 
 A **permission boundary** acts like a safety ceiling for an IAM role. It defines the maximum permissions that the role can ever have, regardless of any other permissions attached to it later.
@@ -135,7 +135,7 @@ The policy we attached:
 
 ![Permission boundary JSON](screenshots/phase_one/permission_boundary_json.png)
 
-This IAM policy follows the principle of least privilege by allowing only AWS Systems Manager (SSM) Session Manager actions on EC2 instances that are explicitly tagged as `BreakGlassEligible=true`. 
+This IAM policy follows the principle of least privilege by allowing only AWS Systems Manager (SSM) Session Manager actions on EC2 instances that are explicitly tagged as `BreakGlassEligible=true`.
 
 This helps ensure that administrators can securely access only approved emergency ("break-glass") instances while preventing unauthorized access to other resources.
 
@@ -143,7 +143,7 @@ This helps ensure that administrators can securely access only approved emergenc
 
 ### 2 · Access is opt-in per instance
 
-The `BreakGlassEligible=true` condition adds an extra layer of security by requiring an EC2 instance to be explicitly tagged before the break-glass role can access it through AWS Systems Manager Session Manager. 
+The `BreakGlassEligible=true` condition adds an extra layer of security by requiring an EC2 instance to be explicitly tagged before the break-glass role can access it through AWS Systems Manager Session Manager.
 
 Until an administrator deliberately applies this tag, the instance remains inaccessible to the break-glass role, reducing the risk of unintended or unauthorized emergency access.
 
@@ -164,7 +164,7 @@ In short, the trust policy ensures that this sensitive role cannot be casually a
 
 ### 4 · Separation of duties
 
-The solution includes a separation-of-duties check to help prevent the same person from both requesting and approving emergency access. In the current implementation, this is enforced by the Approval Handler through a simple string comparison between the requester's identity and the approver's identity. 
+The solution includes a separation-of-duties check to help prevent the same person from both requesting and approving emergency access. In the current implementation, this is enforced by the Approval Handler through a simple string comparison between the requester's identity and the approver's identity.
 While this provides a basic safeguard against self-approval, it should not be considered a foolproof security control for production. A more robust implementation would use identity-aware authorization mechanisms and stronger validation to enforce separation of duties in production environments.
 
 
@@ -182,7 +182,7 @@ As shown in the policy, the role can assume only the designated break-glass IAM 
 
 ### Phase 1 - Foundation: DynamoDB + permission boundary
 
-*Phase 1* establishes the security foundation of the break-glass solution by creating the DynamoDB table used to securely track access requests and approvals, while also implementing a permission boundary to limit the maximum privileges that can ever be granted. 
+*Phase 1* establishes the security foundation of the break-glass solution by creating the DynamoDB table used to securely track access requests and approvals, while also implementing a permission boundary to limit the maximum privileges that can ever be granted.
 Building these controls first ensures that every subsequent component operates within predefined security limits and that all privileged access can be recorded and monitored from the outset. This security-first approach reduces the risk of privilege escalation and provides a trusted foundation for the rest of the system.
 
 
@@ -198,7 +198,7 @@ The table was also configured to use **on-demand capacity**, allowing DynamoDB t
 
 ![DynamoDB table configuration](screenshots/phase_one/create_dynamodb_table_details.png)
 
-**What we observed:** After creating the table, DynamoDB completed the provisioning process and the table status changed to **Active** within a short period (typically around 30 seconds). Opening the **Explore items** tab showed an empty table, which was the expected result because no break-glass requests had been submitted yet. 
+**What we observed:** After creating the table, DynamoDB completed the provisioning process and the table status changed to **Active** within a short period (typically around 30 seconds). Opening the **Explore items** tab showed an empty table, which was the expected result because no break-glass requests had been submitted yet.
 
 
 
@@ -298,7 +298,7 @@ state machine.
 We confirmed the function runs under `BreakGlass-LambdaExecutionRole`, not an auto-generated one:
 
 ![Execution role confirmed](screenshots/phase_three/request_handler_execution_role.png)
- 
+
 ![Grant record written](screenshots/phase_one/dynamo_table_items.png)
 
 #### Step 2 · Approval Handler
@@ -306,7 +306,7 @@ We confirmed the function runs under `BreakGlass-LambdaExecutionRole`, not an au
 Before minting any emergency credentials, the Approval Handler enforces strict four-eyes security. It verifies that a valid grant request exists, confirms it is still pending, and guarantees that the approver is not the requester, blocking self-approval attacks at the door.
 
 ![Approval Handler function](screenshots/phase_three/lambda_approval_handler_details.png)
- 
+
 #### Step 3 · Auto-Revoke
 
 The Auto-Revoke function acts as an automated fail-safe, invalidating temporary access grants and updating the session state as soon as the emergency window expires.
@@ -314,24 +314,24 @@ The Auto-Revoke function acts as an automated fail-safe, invalidating temporary 
 Crucially, it only blocks new API calls made after revocation. It does not forcibly sever active network connections, kill in-flight processes, or terminate live sessions already established during the access window
 
 ![Auto-Revoke function](screenshots/phase_three/lambda_auto_revoke_details.png)
- 
+
 ---
 
 ### Phase 4 - Orchestration: SNS, API Gateway, Step Functions
 
-API Gateway exposes secure, authenticated entry points for break-glass requests, while Step Functions orchestrates the precise state machine governing approvals, timeouts, and automated teardowns. 
+API Gateway exposes secure, authenticated entry points for break-glass requests, while Step Functions orchestrates the precise state machine governing approvals, timeouts, and automated teardowns.
 SNS ties the human element into the loop, dispatching real-time alerts to security teams at every critical lifecycle event. Together, they transform isolated Lambda functions into a deterministic, fully audited emergency workflow with zero room for manual bypass.
 
 #### Step 1 · Create the SNS topic and confirm the subscription
 
-We created a Standard topic named `breakglass-approvals` — the single channel every notification
+We created a Standard topic named `breakglass-approvals`, the single channel every notification
 in the system flows through: approval requests, credential handoffs, revocations and tripwire
 alerts.
 
 ![SNS topic details](screenshots/phase_four/sns_topic_details_01.png)
 
 An email subscription stays in *Pending confirmation* until the recipient clicks the link AWS
-sends. Until then SNS accepts publishes and silently drops them — no error anywhere.
+sends. Until then SNS accepts publishes and silently drops them: no error anywhere.
 
 ![Subscription confirmed](screenshots/phase_four/sns_confirmd_subscription.png)
 
@@ -339,7 +339,7 @@ sends. Until then SNS accepts publishes and silently drops them — no error any
 
 #### Step 2 · Replace the SNS placeholders in all three functions
 
-<!-- TODO: note how many separate edits this took — this is the pain point that argues for
+<!-- TODO: note how many separate edits this took: this is the pain point that argues for
      environment variables. See Known Limitations #8. -->
 
 ![Lambdas updated with the real SNS topic ARN](screenshots/phase_four/updated_lambdas_with_sns_topic.png)
@@ -363,11 +363,11 @@ Nothing is reachable until the API is deployed to a stage:
 ![Invoke URL](screenshots/phase_four/api_method_invoke_url_details.png)
 
 **What we observed:** hitting the invoke URL with a made-up `grant_id` returned
-`{"error": "Grant not found"}`. That error is the success signal — it proves API Gateway reached
+`{"error": "Grant not found"}`. That error is the success signal: it proves API Gateway reached
 the Lambda and the Lambda ran its DynamoDB lookup. A wiring failure would have returned a 403 or
 502 from the gateway instead.
 
-![Expected failure — Grant not found](screenshots/phase_four/invoke_url_expected_failure.png)
+![Expected failure: Grant not found](screenshots/phase_four/invoke_url_expected_failure.png)
 
 #### Step 4 · Put the real approval link in the email
 
@@ -376,18 +376,18 @@ link carrying the grant ID.
 
 ![Request Handler updated with the approval URL](screenshots/phase_four/modified_request_handler_with_url.png)
 
-**What we observed:** the function ran clean end to end for the first time — `statusCode 200` with
+**What we observed:** the function ran clean end to end for the first time: `statusCode 200` with
 a real `grant_id` and `status: pending`, no SNS placeholder error.
 
 ![Successful Request Handler test](screenshots/phase_four/success_test_for_request_handler.png)
 
 <!-- NOTE: if this screenshot was actually taken after Step 6 rather than Step 4,
-     move it down to Step 6 — it works as evidence for either. -->
+     move it down to Step 6; it works as evidence for either. -->
 
 #### Step 5 · Build the Step Functions state machine
 
 The state machine is the timer. It reads `wait_seconds` from its input, waits, then invokes
-Auto-Revoke with the grant ID. Two states, no branching — deliberately small enough to audit at a
+Auto-Revoke with the grant ID. Two states and no branching, deliberately small enough to audit at a
 glance.
 
 ![State machine definition](screenshots/phase_four/state_machine_code.png)
@@ -403,52 +403,115 @@ glance.
 #### Step 6 · Wire the Request Handler to start the state machine
 
 The Request Handler could write to DynamoDB and publish to SNS, but nothing started the timer. That
-needed two changes: a new `states:StartExecution` permission on the execution role, scoped to this
-one state machine —
+needed two changes. First, a new `states:StartExecution` permission on the execution role,
+scoped to this one state machine:
 
 ![Execution role with StartExecution permission](screenshots/phase_four/wired_lambda_execution_role.png)
 
-— and the `start_execution` call itself, using the grant ID as the execution name so a retry can
-never start two timers for the same grant.
+Second, the `start_execution` call itself, using the grant ID as the execution name so a retry
+can never start two timers for the same grant.
 
 ![Request Handler starting the state machine](screenshots/phase_four/updated_request_handler-state-machine.png)
 
-**What we observed:** <!-- TODO: all three things firing at once — the DynamoDB record, the
+**What we observed:** <!-- TODO: all three things firing at once: the DynamoDB record, the
      approval email, and a waiting Step Functions execution -->
 
 ---
 
-### Phase 5 — Audit and Failsafe
+### Phase 5 - Audit and Failsafe
 
-<!-- TODO: 2–3 sentences. -->
+The first four phases built the machinery that grants access. This one builds the machinery that
+watches it. Everything here assumes the rest of the system will eventually fail or be bypassed:
+CloudTrail records what happened regardless of how it happened, Security Hub watches for the
+controls themselves drifting, an EventBridge tripwire fires the moment the break-glass role is
+assumed by anyone through any path, and a scheduled sweep catches grants that Step Functions
+never got round to expiring.
 
 #### Step 1 · Confirm CloudTrail is recording
 
-<!-- TODO -->
+CloudTrail is the immutable record underneath everything else. Every `AssumeRole` call on the
+break-glass role lands here with the caller identity, timestamp, source IP, and every subsequent
+API call made during that session, which is precisely the attribution a shared emergency account
+can never give you.
 
-<!-- TODO: ![CloudTrail](screenshots/phase_five/...) -->
+![CloudTrail trail creation](screenshots/phase_five/cloudtrail_trail_creation_001.png)
+
+Management events are the ones that matter for this system. Read and Write are both enabled so
+that lookups as well as changes are captured.
+
+![Management events enabled](screenshots/phase_five/cloudtrail_management_events.png)
+
+**What we observed:** <!-- TODO: what the event history showed when you checked it -->
+
+![Verified event history](screenshots/phase_five/verified_cloudtrail_event_history.png)
 
 #### Step 2 · Enable Security Hub
 
-<!-- TODO -->
+CloudTrail tells you what happened. Security Hub tells you when the guardrails themselves have
+moved, for instance if the permission boundary is ever detached from the break-glass role, or
+credentials sit unused and unrotated.
 
-<!-- TODO: ![Security Hub](screenshots/phase_five/...) -->
+![Enabling Security Hub](screenshots/phase_five/enabling_securityhub.png)
+
+We enabled the **AWS Foundational Security Best Practices** standard, which covers the IAM and
+logging checks most relevant to this build.
+
+![Foundational Security Best Practices enabled](screenshots/phase_five/checked_aws_best_foundational_practices.png)
+
+**What we observed:** <!-- TODO: findings take 15–30 min to populate; note what you saw and when -->
 
 #### Step 3 · Build the AssumeRole tripwire
 
-<!-- TODO: the EventBridge pattern and why a real-time alert on role assumption matters. -->
+This is the control that does not care whether the approval flow was followed. It watches the
+CloudTrail event stream for **any** `AssumeRole` call targeting `BreakGlass-ElevatedAccessRole`
+and alerts immediately, legitimate approvals included. An alert on every use is the point: if one
+arrives that nobody requested, that is the signal.
 
-<!-- TODO: ![EventBridge rule](screenshots/phase_five/...) -->
+![EventBridge AssumeRole alert rule](screenshots/phase_five/eventbrigde_breakglass_assumealert.png)
 
-**What we observed:** <!-- TODO: the alert email and how long after the assume it arrived -->
+The event pattern matches on `sts.amazonaws.com` as the source, `AssumeRole` as the event name, and
+the specific role ARN as the target: narrow enough that routine role assumptions elsewhere in the
+account stay quiet.
+
+![Event pattern watching CloudTrail](screenshots/phase_five/rule_to_watch_cloudtrail_events.png)
+
+The rule publishes to the same `breakglass-approvals` topic the rest of the system uses, so alerts
+land in the approver's inbox alongside the approval requests.
+
+![SNS topic selected as the alert target](screenshots/phase_five/selecting_snstopic_for_alert.png)
+
+**What we observed:** <!-- TODO: the alert email, and how long after the assume it arrived -->
 
 #### Step 4 · Build the scheduled failsafe
 
-<!-- TODO: the fourth Lambda plus the 5-minute schedule, and what failure it protects against. -->
+Step Functions handles expiry on the happy path. This step assumes it will not always. If an
+execution fails, is stopped manually, or never starts, a grant can sit at `active` in DynamoDB
+indefinitely: the credentials themselves have expired, but the record lies about the system's
+state, which matters for auditing.
 
-<!-- TODO: ![Failsafe schedule](screenshots/phase_five/...) -->
+A fourth Lambda does the sweep: scan for anything still `active` past its `expires_at`, and hand
+each one to Auto-Revoke.
 
-**What we observed:** <!-- TODO: `{"scanned": true, "revoked_count": 0}` on a clean run -->
+![Failsafe Scanner Lambda code](screenshots/phase_five/failsafe_scanner_lambda_code.png)
+
+Calling one Lambda from another needs an explicit permission the execution role did not have, and
+it is scoped to Auto-Revoke alone rather than to Lambda in general.
+
+![Invoke Lambda policy](screenshots/phase_five/breakglass_invoke_labda_policy_details.png)
+
+An EventBridge schedule runs the scanner every five minutes: frequent enough that a zombie grant
+is never stale for long, cheap enough to leave running permanently.
+
+![Schedule rate](screenshots/phase_five/specifying_scheduled_rule_rate.png)
+
+![Scheduled rule details](screenshots/phase_five/eventbrigde_scheduled_rulee_details.png)
+
+**What we observed:** invoking the scanner manually returned `{"scanned": true, "revoked_count": 0}`,
+which is the correct result on a healthy system: the sweep ran, found no grants still marked
+`active` past their expiry, and revoked nothing. A non-zero `revoked_count` would mean Step
+Functions had failed to expire something.
+
+![Test result](screenshots/phase_five/clean_running_return.png)
 
 ---
 
@@ -456,7 +519,7 @@ never start two timers for the same grant.
 
 **Tested:** <!-- TODO: date --> · **Result:** <!-- TODO: passed / passed after fixes -->
 
-<!-- TODO: This is the most credible section in the whole document — a real trace beats
+<!-- TODO: This is the most credible section in the whole document: a real trace beats
      any amount of description. Narrate the actual run, in order, with the evidence
      inline at each step. -->
 
@@ -482,7 +545,7 @@ that has stopped responding to health checks." -->
 <!-- TODO: the second email, record flipping to active -->
 
 **7 · The session opens.**
-<!-- TODO: this is the money shot — the actual SSM session on the instance -->
+<!-- TODO: this is the money shot: the actual SSM session on the instance -->
 
 **8 · The tripwire fires.**
 <!-- TODO: the EventBridge alert email -->
@@ -496,7 +559,7 @@ that has stopped responding to health checks." -->
 ### Negative tests
 
 <!-- TODO: These are what prove the controls actually bite. Each one is worth a
-     screenshot of the denial — a denied action is stronger evidence than a
+     screenshot of the denial: a denied action is stronger evidence than a
      successful one. -->
 
 **Requester tries to approve their own request.**
@@ -509,7 +572,7 @@ Expected `409`. <!-- TODO: observed + screenshot -->
 Expected `AccessDenied`. <!-- TODO: observed + screenshot -->
 
 **Calling a non-SSM API with the break-glass credentials.**
-Expected `AccessDenied` — this is the boundary doing its job. <!-- TODO: observed + screenshot -->
+Expected `AccessDenied`: this is the boundary doing its job. <!-- TODO: observed + screenshot -->
 
 **Reusing the credentials after expiry.**
 Expected `ExpiredToken`. <!-- TODO: observed + screenshot -->
@@ -521,9 +584,9 @@ Expected `ExpiredToken`. <!-- TODO: observed + screenshot -->
 ### SSM Session Manager needs the session document in the boundary
 
 **Symptom.** <!-- TODO: what the error actually said, verbatim if you have it. This is the
-     problem that cost you the most time during testing — describe it properly. -->
+     problem that cost you the most time during testing; describe it properly. -->
 
-**Diagnosis.** `ssm:StartSession` authorises against *two* resources, not one — the target EC2
+**Diagnosis.** `ssm:StartSession` authorises against *two* resources, not one: the target EC2
 instance **and** the Session Manager document (`SSM-SessionManagerRunShell`). The permission
 boundary as originally written only allowed the instance, so the call was denied at the document.
 The `ssm:resourceTag/BreakGlassEligible` condition also cannot apply to a document ARN, which is
@@ -538,7 +601,7 @@ why the document needs its own statement rather than being folded into the exist
 <!-- TODO: ![Corrected boundary](screenshots/...) -->
 
 **Takeaway.** <!-- TODO: 1–2 sentences. Something like: a permission boundary is only as good as
-     your understanding of which resources an API call actually touches — and the docs don't
+     your understanding of which resources an API call actually touches, and the docs don't
      always make that obvious. -->
 
 ### <!-- TODO: second lesson, if you have one -->
@@ -563,7 +626,7 @@ approve a request before a human ever reads it.
 *Planned fix:* confirmation page on `GET`, state change on `POST`.
 
 **3 · Credentials are emailed in plaintext.**
-They persist in mailboxes, backups and SNS delivery logs — and they reach the approver rather
+They persist in mailboxes, backups and SNS delivery logs, and they reach the approver rather
 than the requester.
 *Planned fix:* notify only; the requester retrieves credentials once from an authenticated endpoint.
 
@@ -591,7 +654,7 @@ Every environment means hand-editing several files, and it is easy to miss one.
 
 **9 · The whole thing was built by console click-through.**
 Not reproducible, and no review trail on infrastructure changes.
-*Planned fix:* Terraform — see [`terraform/`](terraform/).
+*Planned fix:* Terraform (see [`terraform/`](terraform/)).
 
 ---
 
@@ -639,7 +702,7 @@ Not reproducible, and no review trail on infrastructure changes.
 - [ ] <!-- TODO: signed, single-use approval tokens -->
 - [ ] <!-- TODO: Slack interactive approve/deny buttons in place of email -->
 - [ ] <!-- TODO: explicit deny path with an audit record -->
-- [ ] <!-- TODO: second scenario — scoped S3 access -->
+- [ ] <!-- TODO: second scenario: scoped S3 access -->
 - [ ] <!-- TODO: CloudWatch dashboard -->
 
 ---
