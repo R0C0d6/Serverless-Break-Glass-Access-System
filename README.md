@@ -335,12 +335,11 @@ sends. Until then SNS accepts publishes and silently drops them: no error anywhe
 
 ![Subscription confirmed](screenshots/phase_four/sns_confirmd_subscription.png)
 
-**What we observed:** <!-- TODO: how long the confirmation email took to arrive -->
+**What we observed:** The confirmation email arrived within about 30 Seconds. Until the confirmation link was clicked, the subscription remained in Pending confirmation, and although Amazon SNS accepted published messages, no emails were delivered. Once confirmed, the subscription status changed to Confirmed, and subsequent notifications were delivered successfully.
 
 #### Step 2 · Replace the SNS placeholders in all three functions
 
-<!-- TODO: note how many separate edits this took: this is the pain point that argues for
-     environment variables. See Known Limitations #8. -->
+We had to update the SNS topic ARN in three separate functions. Although the change was straightforward, repeating the same edit across multiple files increased the risk of inconsistencies. Using environment variables would eliminate this duplication, making future updates faster, safer, and easier to maintain.
 
 ![Lambdas updated with the real SNS topic ARN](screenshots/phase_four/updated_lambdas_with_sns_topic.png)
 
@@ -392,7 +391,7 @@ glance.
 
 ![State machine definition](screenshots/phase_four/state_machine_code.png)
 
-**What we observed:** <!-- TODO: describe the 10-second test run -->
+**What we observed:** For testing, we set wait_seconds to 10. The state machine entered the Wait state, paused for approximately 10 seconds, then automatically transitioned to the Auto-Revoke Lambda function. The execution completed successfully, and the temporary access grant was revoked exactly as expected, confirming that the timed revocation workflow operated correctly.
 
 ![Execution with a 10 second wait](screenshots/phase_four/state_machine_graph_10seconds.png)
 
@@ -413,8 +412,7 @@ can never start two timers for the same grant.
 
 ![Request Handler starting the state machine](screenshots/phase_four/updated_request_handler-state-machine.png)
 
-**What we observed:** <!-- TODO: all three things firing at once: the DynamoDB record, the
-     approval email, and a waiting Step Functions execution -->
+**What we observed:** As soon as the request was submitted, three actions occurred almost simultaneously: a new grant request was written to DynamoDB, an approval notification email was sent through Amazon SNS, and a Step Functions execution started and entered its waiting state. Using the grant ID as the execution name ensured that retries could not create duplicate timer executions for the same grant, providing an additional layer of reliability.
 
 ---
 
@@ -441,7 +439,12 @@ that lookups as well as changes are captured.
 
 ![Management events enabled](screenshots/phase_five/cloudtrail_management_events.png)
 
-**What we observed:** <!-- TODO: what the event history showed when you checked it -->
+**What we observed:** Management events are the ones that matter for this system. Both **Read** and **Write** events are enabled so that AWS CloudTrail records not only configuration changes but also resource lookups and API requests.
+
+![Management events enabled](screenshots/phase_five/cloudtrail_management_events.png)
+
+**What we observed:** After checking the event history, CloudTrail recorded the management API calls made during testing, including requests to AWS services. Each event showed details such as the event time, user identity, service, action performed, and whether the request completed successfully, providing a clear audit trail of system activity.
+
 
 ![Verified event history](screenshots/phase_five/verified_cloudtrail_event_history.png)
 
@@ -458,7 +461,7 @@ logging checks most relevant to this build.
 
 ![Foundational Security Best Practices enabled](screenshots/phase_five/checked_aws_best_foundational_practices.png)
 
-**What we observed:** <!-- TODO: findings take 15–30 min to populate; note what you saw and when -->
+**What we observed:** After enabling the AWS Foundational Security Best Practices standard, findings did not appear immediately. Initial results began populating after approximately 15 minutes, with Security Hub evaluating the configured IAM, logging, and monitoring resources. Once complete, the dashboard displayed the environment's security findings, confirming that continuous compliance checks were active.
 
 #### Step 3 · Build the AssumeRole tripwire
 
@@ -480,7 +483,7 @@ land in the approver's inbox alongside the approval requests.
 
 ![SNS topic selected as the alert target](screenshots/phase_five/selecting_snstopic_for_alert.png)
 
-**What we observed:** <!-- TODO: the alert email, and how long after the assume it arrived -->
+**What we observed:** What we observed: After the privileged role was assumed, an alert email was delivered to the breakglass-approvals SNS topic subscribers in approximately 30 seconds. The notification appeared in the approver's inbox alongside the standard approval emails, providing timely visibility whenever emergency access was used.
 
 #### Step 4 · Build the scheduled failsafe
 
