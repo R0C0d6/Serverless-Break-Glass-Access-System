@@ -38,6 +38,18 @@ Parameters:
     Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
     Description: Resolves to the current Amazon Linux 2 AMI. Never hardcode AMI IDs.
 
+  ApproverEmail:
+    Type: String
+    Description: Address that receives approval requests. Must be confirmed by hand after deploy.
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: must be a valid email address.
+
+  ApiStageName:
+    Type: String
+    Default: prod
+    Description: API Gateway stage name, which appears in the invoke URL.
+    AllowedPattern: '^[a-z0-9]+$'
+
 Resources:
 
   # ---------------------------------------------------------------------------
@@ -309,10 +321,88 @@ Resources:
             Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
 
   # ---------------------------------------------------------------------------
+  # Phase 4: notifications and the approval endpoint.
+  # ---------------------------------------------------------------------------
+
+  # Name must match the ARN the Lambda execution policy already scopes sns:Publish to.
+  ApprovalsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-approvals-${Environment}'
+      DisplayName: Break-Glass Approvals
+
+  # CloudFormation can create this but cannot confirm it. The subscription reports
+  # CREATE_COMPLETE while sitting in PendingConfirmation until the link is clicked.
+  #
+  # Renamed from ApproverSubscription to force a brand new subscription: the old
+  # one reached Deleted, and a confirmation token is bound to one subscription only.
+  # Confirm the new email BEFORE redeploying, or this repeats.
+  ApproverSubscriptionV2:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ApprovalsTopic
+      Protocol: email
+      Endpoint: !Ref ApproverEmail
+
+  ApprovalApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-approval-api-${Environment}'
+      Description: Serves the approval link embedded in the request email.
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # The /approve path.
+  ApproveResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApprovalApi
+      ParentId: !GetAtt ApprovalApi.RootResourceId
+      PathPart: approve
+
+  # AWS_PROXY passes the whole request, including query strings, to the Lambda.
+  ApproveMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApprovalApi
+      ResourceId: !Ref ApproveResource
+      HttpMethod: GET
+      # No authorizer. See Known Limitations 1 and 2: anyone with the link can approve.
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        # Always POST: this is how API Gateway talks to Lambda, regardless of the client's verb.
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApprovalHandler.Arn}/invocations'
+
+  # Without this, API Gateway returns 500 on every call. The console asks
+  # "Add Permission to Lambda Function?" and does it for you.
+  ApprovalHandlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApprovalHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApprovalApi}/*/GET/approve'
+
+  # DependsOn is mandatory: without it CloudFormation can deploy before the method
+  # exists, producing a live API with no routes.
+  ApprovalApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApproveMethod
+    Properties:
+      RestApiId: !Ref ApprovalApi
+
+  ApprovalApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApprovalApi
+      DeploymentId: !Ref ApprovalApiDeployment
+      StageName: !Ref ApiStageName
+
+  # ---------------------------------------------------------------------------
   # Phase 3: the three Lambdas. Every ARN arrives as an environment variable,
   # so nothing is hardcoded and the same code deploys to any environment.
-  # SNS_TOPIC_ARN is empty until Phase 4; each function skips publishing when
-  # it is blank, so all three are testable right now.
   # ---------------------------------------------------------------------------
 
   RequestHandler:
@@ -327,7 +417,10 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref GrantsTable
-          SNS_TOPIC_ARN: ''
+          SNS_TOPIC_ARN: !Ref ApprovalsTopic
+          # Built from the API and stage, so no invoke URL is ever pasted by hand.
+          APPROVAL_BASE_URL: !Sub 'https://${ApprovalApi}.execute-api.${AWS::Region}.amazonaws.com/${ApprovalApiStage}'
+          APPROVER_EMAIL: !Ref ApproverEmail
       Code:
         ZipFile: |
           import json, os, uuid, boto3
@@ -335,6 +428,8 @@ Resources:
 
           TABLE = os.environ['TABLE_NAME']
           TOPIC = os.environ.get('SNS_TOPIC_ARN', '')
+          BASE_URL = os.environ.get('APPROVAL_BASE_URL', '')
+          APPROVER = os.environ.get('APPROVER_EMAIL', '')
           ddb = boto3.resource('dynamodb')
           sns = boto3.client('sns')
 
@@ -359,11 +454,14 @@ Resources:
                   'approver': 'none', 'approved_at': 'none', 'expires_at': 'none'})
 
               if TOPIC:
+                  link = f"{BASE_URL}/approve?grant_id={grant_id}&approver={APPROVER}"
                   sns.publish(TopicArn=TOPIC,
                       Subject='ACTION REQUIRED: Break-Glass Access Request',
                       Message=(f"Requester: {requester}\nInstance: {instance_id}\n"
                                f"Reason: {reason}\nDuration: {duration} min\n"
-                               f"Grant ID: {grant_id}"))
+                               f"Grant ID: {grant_id}\n\n"
+                               f"To APPROVE, click:\n{link}\n\n"
+                               f"To deny, ignore this email."))
 
               return {'statusCode': 200, 'body': json.dumps(
                   {'grant_id': grant_id, 'status': 'pending'})}
@@ -381,7 +479,7 @@ Resources:
         Variables:
           TABLE_NAME: !Ref GrantsTable
           BREAK_GLASS_ROLE_ARN: !GetAtt ElevatedAccessRole.Arn
-          SNS_TOPIC_ARN: ''
+          SNS_TOPIC_ARN: !Ref ApprovalsTopic
       Code:
         ZipFile: |
           import json, os, boto3
@@ -463,7 +561,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref GrantsTable
-          SNS_TOPIC_ARN: ''
+          SNS_TOPIC_ARN: !Ref ApprovalsTopic
       Code:
         ZipFile: |
           import json, os, boto3
@@ -551,6 +649,18 @@ Outputs:
     Value: !Ref BreakGlassTargetInstance
     Export:
       Name: !Sub '${AWS::StackName}-TargetInstanceId'
+
+  ApprovalsTopicArn:
+    Description: SNS topic every notification flows through.
+    Value: !Ref ApprovalsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ApprovalsTopicArn'
+
+  ApprovalApiUrl:
+    Description: Base invoke URL. Append /approve?grant_id=...&approver=... to use it.
+    Value: !Sub 'https://${ApprovalApi}.execute-api.${AWS::Region}.amazonaws.com/${ApprovalApiStage}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApprovalApiUrl'
 
   ElevatedAccessRoleArn:
     Description: Role the Approval Handler assumes to mint credentials.
