@@ -311,6 +311,12 @@ Resources:
             Action: sns:Publish
             Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-approvals-${Environment}'
 
+          # Start exactly one state machine, not any in the account.
+          - Sid: StartGrantTimer
+            Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref GrantTimerStateMachine
+
           # Only this project's own log groups.
           - Sid: WriteOwnLogs
             Effect: Allow
@@ -405,11 +411,65 @@ Resources:
   # so nothing is hardcoded and the same code deploys to any environment.
   # ---------------------------------------------------------------------------
 
+  # Step Functions needs its own identity. It can invoke exactly one function.
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-statemachine-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-statemachine-invoke-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AutoRevoke.Arn
+
+  # The grant timer: wait out the duration, then hand the grant to Auto-Revoke.
+  # Two states, no branching, so the whole thing is auditable at a glance.
+  GrantTimerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-grant-timer-${Environment}'
+      # Standard, not Express: Express caps at 5 minutes and cannot hold a long wait.
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      # $.wait_seconds and grant_id.$ survive !Sub untouched: only ${...} is substituted.
+      DefinitionString: !Sub |
+        {
+          "Comment": "Waits out the grant duration, then triggers auto-revoke.",
+          "StartAt": "WaitForGrantDuration",
+          "States": {
+            "WaitForGrantDuration": {
+              "Type": "Wait",
+              "SecondsPath": "$.wait_seconds",
+              "Next": "AutoRevoke"
+            },
+            "AutoRevoke": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AutoRevoke.Arn}",
+                "Payload": { "grant_id.$": "$.grant_id" }
+              },
+              "ResultPath": null,
+              "End": true
+            }
+          }
+        }
+
   RequestHandler:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub '${ProjectName}-request-handler-${Environment}'
-      Description: Accepts an access request and writes it as pending.
+      Description: Accepts an access request, writes it as pending, and starts the timer.
       Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
@@ -421,6 +481,7 @@ Resources:
           # Built from the API and stage, so no invoke URL is ever pasted by hand.
           APPROVAL_BASE_URL: !Sub 'https://${ApprovalApi}.execute-api.${AWS::Region}.amazonaws.com/${ApprovalApiStage}'
           APPROVER_EMAIL: !Ref ApproverEmail
+          STATE_MACHINE_ARN: !Ref GrantTimerStateMachine
       Code:
         ZipFile: |
           import json, os, uuid, boto3
@@ -430,8 +491,10 @@ Resources:
           TOPIC = os.environ.get('SNS_TOPIC_ARN', '')
           BASE_URL = os.environ.get('APPROVAL_BASE_URL', '')
           APPROVER = os.environ.get('APPROVER_EMAIL', '')
+          SFN_ARN = os.environ.get('STATE_MACHINE_ARN', '')
           ddb = boto3.resource('dynamodb')
           sns = boto3.client('sns')
+          sfn = boto3.client('stepfunctions')
 
           def lambda_handler(event, context):
               raw = event.get('body')
@@ -452,6 +515,14 @@ Resources:
                   'duration_minutes': duration, 'status': 'pending',
                   'requested_at': datetime.now(timezone.utc).isoformat(),
                   'approver': 'none', 'approved_at': 'none', 'expires_at': 'none'})
+
+              # Start the timer before notifying. If SNS fails the grant still expires;
+              # the reverse order would leave a grant that never times out.
+              # grant_id as the execution name makes a retry idempotent.
+              if SFN_ARN:
+                  sfn.start_execution(stateMachineArn=SFN_ARN, name=grant_id,
+                      input=json.dumps({'grant_id': grant_id,
+                                        'wait_seconds': duration * 60}))
 
               if TOPIC:
                   link = f"{BASE_URL}/approve?grant_id={grant_id}&approver={APPROVER}"
@@ -655,6 +726,12 @@ Outputs:
     Value: !Ref ApprovalsTopic
     Export:
       Name: !Sub '${AWS::StackName}-ApprovalsTopicArn'
+
+  GrantTimerStateMachineArn:
+    Description: State machine that times each grant out.
+    Value: !Ref GrantTimerStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-GrantTimerStateMachineArn'
 
   ApprovalApiUrl:
     Description: Base invoke URL. Append /approve?grant_id=...&approver=... to use it.
