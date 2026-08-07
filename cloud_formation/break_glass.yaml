@@ -1,0 +1,565 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Break-Glass Access System - Phase 1 of 5.
+  Grants table, permission boundary, and a break-glass-eligible EC2 instance.
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: breakglass
+    Description: Prefix for every resource name in this stack.
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment suffix, so dev and prod can coexist.
+    AllowedValues: [dev, prod]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the test instance. The default VPC is fine.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet with outbound internet access. A default VPC public subnet works.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance size for the test target.
+    # T2 does not exist in newer regions such as eu-north-1. T3 is available everywhere.
+    AllowedValues: [t3.micro, t3.small]
+
+  LatestAmazonLinux2Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Resolves to the current Amazon Linux 2 AMI. Never hardcode AMI IDs.
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # The grants table: one record per access request.
+  # ---------------------------------------------------------------------------
+  GrantsTable:
+    Type: AWS::DynamoDB::Table
+    # Flip both to Retain before production: an audit log should outlive its stack.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${ProjectName}-grants-${Environment}'
+      # On-demand: idle most of the time, bursty during an incident.
+      BillingMode: PAY_PER_REQUEST
+      # Only key attributes are declared. DynamoDB is schemaless for the rest.
+      AttributeDefinitions:
+        - AttributeName: grant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: grant_id
+          KeyType: HASH
+      # 35-day restore window for the audit record.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      # Upgrades from an AWS-owned key to an AWS-managed KMS key in this account.
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # The permission boundary: the hard ceiling on the break-glass role.
+  # ---------------------------------------------------------------------------
+  PermissionBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-permission-boundary-${Environment}'
+      Description: Maximum scope any break-glass role can ever have. SSM sessions on tagged instances only.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+
+          # Reach a machine only if someone deliberately tagged it.
+          - Sid: StartSessionOnTaggedInstances
+            Effect: Allow
+            Action: ssm:StartSession
+            Resource: 'arn:aws:ec2:*:*:instance/*'
+            Condition:
+              StringEquals:
+                'ssm:resourceTag/BreakGlassEligible': 'true'
+
+          # StartSession authorises against the session document too, not just the
+          # instance. Omitting this is what caused the AccessDenied during testing.
+          # The tag condition cannot apply here: a document carries no such tag.
+          - Sid: StartSessionOnSessionDocument
+            Effect: Allow
+            Action: ssm:StartSession
+            Resource:
+              - 'arn:aws:ssm:*:*:document/SSM-SessionManagerRunShell'
+              - 'arn:aws:ssm:*:*:document/AWS-StartSSHSession'
+
+          # Managing a session you already hold. These act on session ARNs, not instances.
+          - Sid: ManageOwnSessions
+            Effect: Allow
+            Action:
+              - ssm:TerminateSession
+              - ssm:ResumeSession
+            Resource: 'arn:aws:ssm:*:*:session/*'
+
+          # Read-only lookups. Neither supports resource-level permissions.
+          - Sid: DescribeOnly
+            Effect: Allow
+            Action:
+              - ssm:DescribeSessions
+              - ssm:GetConnectionStatus
+              - ec2:DescribeInstances
+            Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # The target instance and the identity it needs to be reachable by SSM.
+  # ---------------------------------------------------------------------------
+
+  # SSM is agent-initiated: the instance calls out to AWS, so it needs its own role.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-instance-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      # AWS-managed policy with exactly the SSM agent permissions and nothing else.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-instance-profile-${Environment}'
+      Roles:
+        - !Ref InstanceRole
+
+  # No ingress rules at all. That absence is the entire point of this project.
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound access. Outbound HTTPS only, for the SSM agent.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        # SSM agent reaches ssm, ec2messages and ssmmessages endpoints over 443.
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS service endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-instance-sg-${Environment}'
+
+  BreakGlassTargetInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmazonLinux2Ami
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      # No KeyName property: no SSH key exists, so SSH is impossible by construction.
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-target-${Environment}'
+        # The tag the permission boundary keys on. Without it, this instance is invisible.
+        - Key: BreakGlassEligible
+          Value: 'true'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Phase 2: the two-role spine. One role grants elevated access, the other does
+  # the granting. Neither can do the other's job.
+  # ---------------------------------------------------------------------------
+
+  # The identity the Lambdas run as. Declared first and deliberately policy-free:
+  # its permissions live in a separate resource below, to avoid a circular reference.
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-exec-${Environment}'
+      Description: Execution role for the break-glass Lambdas. Highest-value identity in the system.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  # The role that gets handed out during an incident. No standing access of its own.
+  ElevatedAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-elevated-access-${Environment}'
+      Description: Temporarily assumed for SSM access. Capped by the permission boundary.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Exactly one principal. No human can assume this, however privileged.
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - sts:AssumeRole
+              # Session tags are checked against BOTH the caller's policy and this
+              # trust policy. Omit it here and tagged sessions fail.
+              - sts:TagSession
+
+      # The ceiling from Phase 1. Nothing attached later can exceed it.
+      PermissionsBoundary: !Ref PermissionBoundary
+
+      # Ceiling on how long an assumed session may last. The default is 1 hour,
+      # which silently caps any grant longer than 60 minutes.
+      MaxSessionDuration: 43200
+
+      Policies:
+        # Grants the same actions the boundary permits. Both must allow, so this
+        # deliberate duplication is the second half of the double lock.
+        - PolicyName: !Sub '${ProjectName}-elevated-access-inline-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartSessionOnTaggedInstances
+                Effect: Allow
+                Action: ssm:StartSession
+                Resource: 'arn:aws:ec2:*:*:instance/*'
+                Condition:
+                  StringEquals:
+                    'ssm:resourceTag/BreakGlassEligible': 'true'
+              - Sid: StartSessionOnSessionDocument
+                Effect: Allow
+                Action: ssm:StartSession
+                Resource:
+                  - 'arn:aws:ssm:*:*:document/SSM-SessionManagerRunShell'
+                  - 'arn:aws:ssm:*:*:document/AWS-StartSSHSession'
+              - Sid: ManageOwnSessions
+                Effect: Allow
+                Action:
+                  - ssm:TerminateSession
+                  - ssm:ResumeSession
+                Resource: 'arn:aws:ssm:*:*:session/*'
+              - Sid: DescribeOnly
+                Effect: Allow
+                Action:
+                  - ssm:DescribeSessions
+                  - ssm:GetConnectionStatus
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+  # Split out of LambdaExecutionRole to break the dependency cycle: this policy
+  # needs the elevated role's ARN, and the elevated role needs the Lambda role's ARN.
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-lambda-exec-policy-${Environment}'
+      Roles:
+        - !Ref LambdaExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+
+          # One role, by ARN. Not "any role in the account".
+          - Sid: AssumeBreakGlassRoleOnly
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Resource: !GetAtt ElevatedAccessRole.Arn
+
+          # One table, by ARN, resolved from Phase 1 rather than pasted by hand.
+          - Sid: GrantsTableAccess
+            Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource: !GetAtt GrantsTable.Arn
+
+          # Scoped to the topic Phase 4 will create, rather than the "*" the console build used.
+          - Sid: PublishToApprovalsTopic
+            Effect: Allow
+            Action: sns:Publish
+            Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-approvals-${Environment}'
+
+          # Only this project's own log groups.
+          - Sid: WriteOwnLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+
+  # ---------------------------------------------------------------------------
+  # Phase 3: the three Lambdas. Every ARN arrives as an environment variable,
+  # so nothing is hardcoded and the same code deploys to any environment.
+  # SNS_TOPIC_ARN is empty until Phase 4; each function skips publishing when
+  # it is blank, so all three are testable right now.
+  # ---------------------------------------------------------------------------
+
+  RequestHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-request-handler-${Environment}'
+      Description: Accepts an access request and writes it as pending.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref GrantsTable
+          SNS_TOPIC_ARN: ''
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3
+          from datetime import datetime, timezone
+
+          TABLE = os.environ['TABLE_NAME']
+          TOPIC = os.environ.get('SNS_TOPIC_ARN', '')
+          ddb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              raw = event.get('body')
+              body = json.loads(raw) if isinstance(raw, str) else event
+              requester = body.get('requester')
+              instance_id = body.get('instance_id')
+              reason = body.get('reason')
+              duration = int(body.get('duration_minutes', 30))
+
+              if not all([requester, instance_id, reason]):
+                  return {'statusCode': 400, 'body': json.dumps(
+                      {'error': 'requester, instance_id and reason are required'})}
+
+              grant_id = str(uuid.uuid4())
+              ddb.Table(TABLE).put_item(Item={
+                  'grant_id': grant_id, 'requester': requester,
+                  'instance_id': instance_id, 'reason': reason,
+                  'duration_minutes': duration, 'status': 'pending',
+                  'requested_at': datetime.now(timezone.utc).isoformat(),
+                  'approver': 'none', 'approved_at': 'none', 'expires_at': 'none'})
+
+              if TOPIC:
+                  sns.publish(TopicArn=TOPIC,
+                      Subject='ACTION REQUIRED: Break-Glass Access Request',
+                      Message=(f"Requester: {requester}\nInstance: {instance_id}\n"
+                               f"Reason: {reason}\nDuration: {duration} min\n"
+                               f"Grant ID: {grant_id}"))
+
+              return {'statusCode': 200, 'body': json.dumps(
+                  {'grant_id': grant_id, 'status': 'pending'})}
+
+  ApprovalHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-approval-handler-${Environment}'
+      Description: Validates an approval, then mints scoped temporary credentials.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref GrantsTable
+          BREAK_GLASS_ROLE_ARN: !GetAtt ElevatedAccessRole.Arn
+          SNS_TOPIC_ARN: ''
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+
+          TABLE = os.environ['TABLE_NAME']
+          ROLE_ARN = os.environ['BREAK_GLASS_ROLE_ARN']
+          TOPIC = os.environ.get('SNS_TOPIC_ARN', '')
+          ddb = boto3.resource('dynamodb')
+          sts = boto3.client('sts')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              p = event.get('queryStringParameters') or event
+              grant_id, approver = p.get('grant_id'), p.get('approver')
+              if not grant_id or not approver:
+                  return {'statusCode': 400, 'body': json.dumps(
+                      {'error': 'grant_id and approver are required'})}
+
+              t = ddb.Table(TABLE)
+              item = t.get_item(Key={'grant_id': grant_id}).get('Item')
+              if not item:
+                  return {'statusCode': 404, 'body': json.dumps({'error': 'Grant not found'})}
+              if item['requester'] == approver:
+                  return {'statusCode': 403, 'body': json.dumps(
+                      {'error': 'Requester cannot approve their own request'})}
+
+              # Claim the grant before minting anything. The condition means two
+              # simultaneous clicks cannot both succeed and issue two sessions.
+              try:
+                  t.update_item(Key={'grant_id': grant_id},
+                      UpdateExpression='SET #s=:active, approver=:p, approved_at=:t',
+                      ConditionExpression='#s = :pending',
+                      ExpressionAttributeNames={'#s': 'status'},
+                      ExpressionAttributeValues={':active': 'active', ':p': approver,
+                          ':pending': 'pending',
+                          ':t': datetime.now(timezone.utc).isoformat()})
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return {'statusCode': 409, 'body': json.dumps(
+                          {'error': f"Grant is already {item['status']}"})}
+                  raise
+
+              secs = min(int(item.get('duration_minutes', 30)) * 60, 43200)
+              c = sts.assume_role(RoleArn=ROLE_ARN,
+                  RoleSessionName=f"breakglass-{grant_id[:8]}",
+                  DurationSeconds=secs,
+                  Tags=[{'Key': 'GrantId', 'Value': grant_id},
+                        {'Key': 'Requester', 'Value': item['requester']},
+                        {'Key': 'Approver', 'Value': approver}])['Credentials']
+
+              expires = c['Expiration'].isoformat()
+              t.update_item(Key={'grant_id': grant_id},
+                  UpdateExpression='SET expires_at=:e',
+                  ExpressionAttributeValues={':e': expires})
+
+              if TOPIC:
+                  sns.publish(TopicArn=TOPIC, Subject='Break-Glass Access APPROVED',
+                      Message=(f"Grant: {grant_id}\nRequester: {item['requester']}\n"
+                               f"Approver: {approver}\nExpires: {expires}\n\n"
+                               f"AWS_ACCESS_KEY_ID={c['AccessKeyId']}\n"
+                               f"AWS_SECRET_ACCESS_KEY={c['SecretAccessKey']}\n"
+                               f"AWS_SESSION_TOKEN={c['SessionToken']}"))
+
+              return {'statusCode': 200, 'body': json.dumps(
+                  {'message': 'Access approved', 'grant_id': grant_id,
+                   'expires_at': expires})}
+
+  AutoRevoke:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-auto-revoke-${Environment}'
+      Description: Marks a grant expired once its window closes.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref GrantsTable
+          SNS_TOPIC_ARN: ''
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from datetime import datetime, timezone
+
+          TABLE = os.environ['TABLE_NAME']
+          TOPIC = os.environ.get('SNS_TOPIC_ARN', '')
+          ddb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              grant_id = event.get('grant_id')
+              if not grant_id:
+                  return {'statusCode': 400, 'body': json.dumps(
+                      {'error': 'grant_id is required'})}
+
+              t = ddb.Table(TABLE)
+              item = t.get_item(Key={'grant_id': grant_id}).get('Item')
+              if not item:
+                  return {'statusCode': 404, 'body': json.dumps({'error': 'Grant not found'})}
+              if item['status'] == 'expired':
+                  return {'statusCode': 200, 'body': json.dumps(
+                      {'message': 'Already expired, nothing to do'})}
+
+              revoked = datetime.now(timezone.utc).isoformat()
+              t.update_item(Key={'grant_id': grant_id},
+                  UpdateExpression='SET #s=:s, revoked_at=:r',
+                  ExpressionAttributeNames={'#s': 'status'},
+                  ExpressionAttributeValues={':s': 'expired', ':r': revoked})
+
+              if TOPIC:
+                  sns.publish(TopicArn=TOPIC, Subject='Break-Glass Access REVOKED',
+                      Message=(f"Grant: {grant_id}\n"
+                               f"Requester: {item.get('requester', 'unknown')}\n"
+                               f"Revoked at: {revoked}\n\n"
+                               f"The STS credentials for this session have expired."))
+
+              return {'statusCode': 200, 'body': json.dumps(
+                  {'message': 'Grant revoked', 'grant_id': grant_id})}
+
+  # Declared explicitly so logs expire. Lambda's own log groups never do by default.
+  RequestHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-request-handler-${Environment}'
+      RetentionInDays: 14
+
+  ApprovalHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-approval-handler-${Environment}'
+      RetentionInDays: 14
+
+  AutoRevokeLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-auto-revoke-${Environment}'
+      RetentionInDays: 14
+
+Outputs:
+
+  GrantsTableName:
+    Description: Name of the grants table.
+    Value: !Ref GrantsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-GrantsTableName'
+
+  GrantsTableArn:
+    Description: Grants table ARN, for scoping IAM policies in Phase 2.
+    Value: !GetAtt GrantsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GrantsTableArn'
+
+  PermissionBoundaryArn:
+    Description: Boundary ARN. Phase 2 attaches this to the break-glass role.
+    Value: !Ref PermissionBoundary
+    Export:
+      Name: !Sub '${AWS::StackName}-PermissionBoundaryArn'
+
+  TargetInstanceId:
+    Description: Instance ID to use as the SSM session target when testing.
+    Value: !Ref BreakGlassTargetInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetInstanceId'
+
+  ElevatedAccessRoleArn:
+    Description: Role the Approval Handler assumes to mint credentials.
+    Value: !GetAtt ElevatedAccessRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ElevatedAccessRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: Execution role for every Lambda in Phase 3.
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
