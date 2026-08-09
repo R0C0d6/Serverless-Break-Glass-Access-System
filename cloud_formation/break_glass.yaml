@@ -50,6 +50,18 @@ Parameters:
     Description: API Gateway stage name, which appears in the invoke URL.
     AllowedPattern: '^[a-z0-9]+$'
 
+  EnableSecurityHub:
+    Type: String
+    Default: 'no'
+    Description: >
+      Security Hub is billed per check and fails to create if already enabled
+      in this account and region. Set to yes only if it is currently off.
+    AllowedValues: ['yes', 'no']
+
+Conditions:
+
+  ShouldEnableSecurityHub: !Equals [!Ref EnableSecurityHub, 'yes']
+
 Resources:
 
   # ---------------------------------------------------------------------------
@@ -310,6 +322,12 @@ Resources:
             Effect: Allow
             Action: sns:Publish
             Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-approvals-${Environment}'
+
+          # The failsafe scanner delegates cleanup to Auto-Revoke, and to nothing else.
+          - Sid: InvokeAutoRevoke
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt AutoRevoke.Arn
 
           # Start exactly one state machine, not any in the account.
           - Sid: StartGrantTimer
@@ -695,6 +713,198 @@ Resources:
       LogGroupName: !Sub '/aws/lambda/${ProjectName}-auto-revoke-${Environment}'
       RetentionInDays: 14
 
+  # ---------------------------------------------------------------------------
+  # Phase 5: audit and failsafe. Everything here assumes the rest will fail.
+  # ---------------------------------------------------------------------------
+
+  # Account ID in the name because bucket names are globally unique.
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    # Deleting the stack fails while this holds objects. Empty it first.
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # CloudTrail checks it can write here before the trail will create at all.
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # DependsOn is required: the trail validates bucket permissions on creation,
+  # and CloudFormation would otherwise race the policy.
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-audit-trail-${Environment}'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      # AssumeRole can happen in any region, so the trail has to watch all of them.
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      # Hashes each log file so tampering is detectable.
+      EnableLogFileValidation: true
+
+  # Optional: billed per check, and creation fails if already enabled.
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: ShouldEnableSecurityHub
+
+  # EventBridge cannot publish to SNS without this. The console adds it silently;
+  # CloudFormation does not, and the rule then fails with no visible error.
+  ApprovalsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ApprovalsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ApprovalsTopic
+
+  # The tripwire. Fires on every assumption of the break-glass role, including
+  # legitimate ones: an alert nobody requested is the signal.
+  AssumeRoleAlertRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-assumerole-alert-${Environment}'
+      Description: Alerts in real time whenever the break-glass role is assumed.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.sts
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - sts.amazonaws.com
+          eventName:
+            - AssumeRole
+          requestParameters:
+            roleArn:
+              - !GetAtt ElevatedAccessRole.Arn
+      Targets:
+        - Id: ApprovalsTopicTarget
+          Arn: !Ref ApprovalsTopic
+
+  # Catches grants Step Functions never expired: a failed, stopped or never-started
+  # execution leaves a record claiming active long after its credentials died.
+  FailsafeScanner:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-failsafe-scanner-${Environment}'
+      Description: Sweeps for grants past expiry but still marked active.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref GrantsTable
+          SNS_TOPIC_ARN: !Ref ApprovalsTopic
+          AUTO_REVOKE_NAME: !Ref AutoRevoke
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from datetime import datetime, timezone
+
+          TABLE = os.environ['TABLE_NAME']
+          TOPIC = os.environ.get('SNS_TOPIC_ARN', '')
+          TARGET = os.environ['AUTO_REVOKE_NAME']
+          ddb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          lam = boto3.client('lambda')
+
+          def lambda_handler(event, context):
+              t = ddb.Table(TABLE)
+              now = datetime.now(timezone.utc).isoformat()
+              # expires_at is ISO-8601 UTC, so string ordering is chronological.
+              resp = t.scan(
+                  FilterExpression='#s = :active AND expires_at < :now',
+                  ExpressionAttributeNames={'#s': 'status'},
+                  ExpressionAttributeValues={':active': 'active', ':now': now})
+              stale = resp.get('Items', [])
+
+              for g in stale:
+                  # Event = fire and forget. One slow revoke cannot stall the sweep.
+                  lam.invoke(FunctionName=TARGET, InvocationType='Event',
+                             Payload=json.dumps({'grant_id': g['grant_id']}))
+
+              if stale and TOPIC:
+                  ids = ', '.join(g['grant_id'] for g in stale)
+                  sns.publish(TopicArn=TOPIC,
+                      Subject=f'Failsafe: {len(stale)} expired grant(s) force-revoked',
+                      Message=(f"Found {len(stale)} grant(s) past expiry but still "
+                               f"active. Auto-Revoke triggered for each.\n\n{ids}"))
+
+              return {'statusCode': 200, 'body': json.dumps(
+                  {'scanned': True, 'revoked_count': len(stale)})}
+
+  FailsafeScannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-failsafe-scanner-${Environment}'
+      RetentionInDays: 14
+
+  FailsafeScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-failsafe-schedule-${Environment}'
+      Description: Runs the failsafe sweep every five minutes.
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: FailsafeScannerTarget
+          Arn: !GetAtt FailsafeScanner.Arn
+
+  # A schedule rule cannot invoke a function without explicit permission.
+  FailsafeScannerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FailsafeScanner
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FailsafeScheduleRule.Arn
+
 Outputs:
 
   GrantsTableName:
@@ -732,6 +942,14 @@ Outputs:
     Value: !Ref GrantTimerStateMachine
     Export:
       Name: !Sub '${AWS::StackName}-GrantTimerStateMachineArn'
+
+  AuditTrailBucket:
+    Description: Bucket holding the CloudTrail logs. Empty it before deleting the stack.
+    Value: !Ref CloudTrailBucket
+
+  FailsafeScannerName:
+    Description: Invoke manually with {} to run the sweep on demand.
+    Value: !Ref FailsafeScanner
 
   ApprovalApiUrl:
     Description: Base invoke URL. Append /approve?grant_id=...&approver=... to use it.
