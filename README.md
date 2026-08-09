@@ -26,6 +26,7 @@ A serverless solution for emergency access management.
 - [Architecture](#architecture)
 - [How Access Flows](#how-access-flows)
 - [The Security Model](#the-security-model)
+- [Reproducing the Whole Stack](#reproducing-the-whole-stack)
 - [Build Walkthrough](#build-walkthrough)
   - [Phase 1 - Foundation](#phase-1---foundation-dynamodb--permission-boundary)
   - [Phase 2 - Identity](#phase-2---identity-the-two-iam-roles)
@@ -175,6 +176,78 @@ The Lambda execution role is the highest-value identity in the break-glass solut
 As shown in the policy, the role can assume only the designated break-glass IAM role, perform only the required operations on the specific DynamoDB grants table, publish approval and notification messages, and write execution logs to CloudWatch. By limiting both the allowed actions and the resources they apply to, the design reduces the attack surface and helps ensure the Lambda function can perform only its intended responsibilities, nothing more.
 
 ![Lambda execution role inline policy](screenshots/phase_two/lambda_execution_role_inline_policy.png)
+
+---
+
+## Reproducing the Whole Stack
+
+Everything in this project was originally built by clicking through the AWS console. **All of it is
+now defined in one CloudFormation template**, [`cloud_formation/break_glass.yaml`](cloud_formation/break_glass.yaml),
+which builds the entire system from an empty account in a single deploy: 35 resources covering the
+grants table, the permission boundary, both IAM roles, a tagged EC2 target, four Lambdas, SNS, the
+approval API, the Step Functions timer, CloudTrail, and both EventBridge rules.
+
+The walkthrough further down is the history of how it was built and what broke. The template is the
+artifact you actually run.
+
+### Parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `ProjectName` | `breakglass` | Prefix for every resource name |
+| `Environment` | `dev` | Suffix, so dev and prod can coexist in one account |
+| `VpcId` | — | Console shows a dropdown. Default VPC is fine |
+| `SubnetId` | — | Must have outbound internet so the SSM agent can register |
+| `InstanceType` | `t3.micro` | T3 only: newer regions such as `eu-north-1` have no T2 family |
+| `ApproverEmail` | — | Receives approval requests. Needs manual confirmation |
+| `ApiStageName` | `prod` | Appears in the approval URL |
+| `EnableSecurityHub` | `no` | Leave as `no` if Security Hub is already on in the account |
+
+### Deploy
+
+```bash
+aws cloudformation deploy \
+  --template-file cloud_formation/break_glass.yaml \
+  --stack-name breakglass-dev \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+      VpcId=vpc-xxxxxxxx \
+      SubnetId=subnet-xxxxxxxx \
+      ApproverEmail=you@example.com
+```
+
+From the console: **CloudFormation → Create stack → Upload a template file**, then tick
+*"I acknowledge that AWS CloudFormation might create IAM resources with custom names."* The stack
+will not deploy without that capability, because it creates named IAM roles.
+
+### Four things that will trip you up
+
+1. **Confirm the SNS subscription by email.** CloudFormation reports `CREATE_COMPLETE` while the
+   subscription sits in `PendingConfirmation`, and an unconfirmed topic accepts every publish and
+   silently discards it. Confirm before redeploying: any change that replaces the subscription
+   invalidates the confirmation link.
+2. **`EnableSecurityHub=no` unless it is genuinely off.** Security Hub is one-per-account-per-region,
+   so enabling it twice returns `409 AlreadyExists` and rolls back the whole update.
+3. **Empty the CloudTrail bucket before deleting the stack.** S3 refuses to delete a non-empty
+   bucket, and the trail starts writing within minutes.
+4. **Use `cfn-lint`, not just `validate-template`.** `aws cloudformation validate-template` only
+   checks that the YAML parses; it does not resolve `!Ref` or `!GetAtt` against declared resources.
+   A template with a dangling reference passes it and fails at deploy time.
+
+### What moving to IaC actually fixed
+
+Three of the limitations below stopped being limitations, because the template makes them
+structurally impossible rather than merely documented:
+
+- **Hardcoded ARNs** disappeared. Every ARN reaches the Lambdas as an environment variable resolved
+  at deploy time, so there is nothing to hand-edit and nothing to miss.
+- **The approval race** is closed by a conditional write that claims the grant before minting
+  credentials.
+- **`sns:Publish` on `"*"`** is now scoped to one topic ARN, constructed by the template.
+
+The console build also needed a two-pass workaround for the trust policy chicken-and-egg problem
+(the elevated role references a Lambda role that does not exist yet). CloudFormation resolves that
+from the dependency graph, so the workaround is unnecessary.
 
 ---
 
@@ -707,10 +780,10 @@ They persist in mailboxes, backups and SNS delivery logs, and they reach the app
 than the requester.
 *Planned fix:* notify only; the requester retrieves credentials once from an authenticated endpoint.
 
-**4 · Approval reads then writes without a condition.**
-Two clicks in quick succession can both pass the "is it still pending?" check and issue two
-separate sessions.
-*Planned fix:* a `ConditionExpression` on the status update.
+**4 · Approval reads then writes without a condition.** ✅ *Fixed in the CloudFormation build.*
+Two clicks in quick succession could both pass the "is it still pending?" check and issue two
+separate sessions. The template's Approval Handler now claims the grant with a `ConditionExpression`
+*before* calling `assume_role`, and returns `409` when the condition fails.
 
 **5 · Auto-revoke does not actually revoke.**
 It updates the DynamoDB record; the credentials themselves remain valid until natural expiry,
@@ -725,9 +798,9 @@ A request raised last week is still approvable today.
 Cost and latency grow with the size of the table.
 *Planned fix:* a GSI on `status`, queried instead of scanned.
 
-**8 · ARNs are hardcoded in function source.**
-Every environment means hand-editing several files, and it is easy to miss one.
-*Planned fix:* Lambda environment variables.
+**8 · ARNs are hardcoded in function source.** ✅ *Fixed in the CloudFormation build.*
+The console build needed the same ARN pasted into several files by hand. Every ARN now arrives as a
+Lambda environment variable resolved by CloudFormation at deploy time.
  
 ---
 
@@ -772,7 +845,8 @@ Every environment means hand-editing several files, and it is easy to miss one.
 
 ## Roadmap
 
-- [ ] Codify the whole stack in Terraform (`terraform/main.tf` is currently empty)
+- [x] Codify the whole stack in CloudFormation - see [`cloud_formation/break_glass.yaml`](cloud_formation/break_glass.yaml)
+- [ ] Split the monolithic template into nested stacks, divided by rate of change
 - [ ] Replace approval links with signed, single-use tokens.
 - [ ] Add Slack interactive Approve/Deny buttons alongside email approvals.
 - [ ] Implement an explicit Deny workflow with a permanent audit record.
@@ -788,8 +862,8 @@ Every environment means hand-editing several files, and it is easy to miss one.
 .
 ├── README.md                  # This document
 ├── break-glass-phase1.md      # Full console build guide, phases 1–5
-├── terraform/                 # Infrastructure as code (in progress)
-│   └── main.tf
+├── cloud_formation/           # The reproducible build
+│   └── break_glass.yaml       # Entire system, one template, 35 resources
 └── screenshots/               # Build and test evidence
     ├── architecture/          # Diagram stills and walkthrough clip
     ├── phase_one/             # DynamoDB, permission boundary, EC2 prep
